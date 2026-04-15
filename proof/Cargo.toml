@@ -19,7 +19,7 @@ reqwest = { version = "0.11", features = ["json"] }
 aws-config = "~1.5"
 aws-sdk-s3 = "~1.40"
 aws-sdk-kms = "~1.40"
-sha2 = "0.10"
+sha2 = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
