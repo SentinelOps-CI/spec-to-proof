@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
-use proof::lib::{ProofServiceImpl, ProofConfig};
+use proof::ProofConfig;
 use proof::proto::proof::v1::*;
 use proof::proto::spec_to_proof::v1::*;
 
-// Mock Claude client for testing
+// Mock Claude client for testing (reserved for compiler integration tests).
+#[allow(dead_code)]
 struct MockClaudeClient {
     responses: HashMap<String, (String, u32, u32)>,
 }
 
+#[allow(dead_code)]
 impl MockClaudeClient {
     fn new() -> Self {
         let mut responses = HashMap::new();
@@ -113,8 +115,8 @@ impl MockS3Storage {
 
 #[tokio::test]
 async fn test_trivial_invariant_compilation() {
-    let config = ProofConfig::default();
-    let mock_claude = MockClaudeClient::new();
+    let _config = ProofConfig::default();
+    let _mock_claude = MockClaudeClient::new();
     
     // Create a trivial invariant
     let invariant = Invariant {
@@ -126,7 +128,7 @@ async fn test_trivial_invariant_compilation() {
         variables: vec![
             Variable {
                 name: "n".to_string(),
-                var_type: "Nat".to_string(),
+                r#type: "Nat".to_string(),
                 description: "Natural number".to_string(),
                 unit: "".to_string(),
                 constraints: vec![],
@@ -141,7 +143,7 @@ async fn test_trivial_invariant_compilation() {
         priority: Priority::Low as i32,
     };
 
-    let options = CompilationOptions {
+    let _options = CompilationOptions {
         temperature: 0.0,
         max_tokens: 1000,
         seed: 42,
@@ -167,7 +169,7 @@ async fn test_trivial_invariant_compilation() {
 
 #[tokio::test]
 async fn test_resnet_invariant_compilation() {
-    let config = ProofConfig::default();
+    let _config = ProofConfig::default();
     
     // Create a ResNet-style invariant
     let invariant = Invariant {
@@ -179,14 +181,14 @@ async fn test_resnet_invariant_compilation() {
         variables: vec![
             Variable {
                 name: "W".to_string(),
-                var_type: "Matrix ℝ m n".to_string(),
+                r#type: "Matrix ℝ m n".to_string(),
                 description: "Weight matrix".to_string(),
                 unit: "".to_string(),
                 constraints: vec![],
             },
             Variable {
                 name: "x".to_string(),
-                var_type: "Vector ℝ n".to_string(),
+                r#type: "Vector ℝ n".to_string(),
                 description: "Input vector".to_string(),
                 unit: "".to_string(),
                 constraints: vec![],
@@ -201,7 +203,7 @@ async fn test_resnet_invariant_compilation() {
         priority: Priority::High as i32,
     };
 
-    let options = CompilationOptions {
+    let _options = CompilationOptions {
         temperature: 0.0,
         max_tokens: 8000,
         seed: 42,
@@ -218,7 +220,7 @@ async fn test_resnet_invariant_compilation() {
 
 #[tokio::test]
 async fn test_proof_generation_with_retry() {
-    let config = ProofConfig {
+    let _config = ProofConfig {
         max_retries: 3,
         retry_delay_ms: 100,
         ..Default::default()
@@ -240,7 +242,7 @@ theorem test_theorem (n : Nat) : n + 0 = n := by
         metadata: HashMap::new(),
     };
 
-    let options = ProofOptions {
+    let _options = ProofOptions {
         temperature: 0.0,
         max_tokens: 1000,
         seed: 42,
@@ -285,7 +287,7 @@ theorem test_theorem (n : Nat) : n + 0 = n := by
 
     let s3_config = S3Config {
         bucket_name: "test-bucket".to_string(),
-        key_prefix: Some("theorems/".to_string()),
+        key_prefix: "theorems/".to_string(),
         region: "us-east-1".to_string(),
         encryption: None,
     };
@@ -361,7 +363,7 @@ async fn test_benchmark_resnet_example() {
         let start_time = Instant::now();
         
         // Simulate ResNet invariant processing
-        let invariant = Invariant {
+        let _invariant = Invariant {
             id: format!("resnet_inv_{}", i),
             content_sha256: "hash".to_string(),
             description: "ResNet weight matrix norm bound".to_string(),
@@ -370,14 +372,14 @@ async fn test_benchmark_resnet_example() {
             variables: vec![
                 Variable {
                     name: "W".to_string(),
-                    var_type: "Matrix ℝ m n".to_string(),
+                    r#type: "Matrix ℝ m n".to_string(),
                     description: "Weight matrix".to_string(),
                     unit: "".to_string(),
                     constraints: vec![],
                 },
                 Variable {
                     name: "x".to_string(),
-                    var_type: "Vector ℝ n".to_string(),
+                    r#type: "Vector ℝ n".to_string(),
                     description: "Input vector".to_string(),
                     unit: "".to_string(),
                     constraints: vec![],
@@ -441,7 +443,7 @@ async fn test_fuzz_prompt_injection() {
         
         for _ in 0..input_length {
             let byte = rng.gen_range(32..127); // Printable ASCII
-            input.push(byte as char);
+            input.push(char::from_u32(byte as u32).unwrap_or('?'));
         }
         
         // Randomly inject patterns
@@ -493,7 +495,7 @@ async fn test_timeout_handling() {
 
 #[tokio::test]
 async fn test_error_handling() {
-    let config = ProofConfig::default();
+    let _config = ProofConfig::default();
     
     // Test handling of invalid invariants
     let invalid_invariant = Invariant {
@@ -538,7 +540,7 @@ async fn test_concurrent_compilation() {
                 variables: vec![
                     Variable {
                         name: "x".to_string(),
-                        var_type: "Nat".to_string(),
+                        r#type: "Nat".to_string(),
                         description: "Natural number".to_string(),
                         unit: "".to_string(),
                         constraints: vec![],

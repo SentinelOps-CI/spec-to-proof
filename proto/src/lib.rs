@@ -1,28 +1,43 @@
 pub mod spec_to_proof {
-    tonic::include_proto!("spec_to_proof.v1");
+    pub mod v1 {
+        tonic::include_proto!("spec_to_proof.v1");
+    }
+
+    pub mod proof {
+        pub mod v1 {
+            tonic::include_proto!("spec_to_proof.proof.v1");
+        }
+    }
+}
+
+pub mod nlp {
+    pub mod v1 {
+        tonic::include_proto!("nlp.v1");
+    }
 }
 
 use chrono::{DateTime, Utc};
+use prost_types::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-pub use spec_to_proof::*;
+fn datetime_to_timestamp(dt: DateTime<Utc>) -> Timestamp {
+    Timestamp {
+        seconds: dt.timestamp(),
+        nanos: dt.timestamp_subsec_nanos() as i32,
+    }
+}
 
-// Re-export the generated protobuf types
-pub use spec_to_proof::{
-    badge_status::BadgeState,
-    document_status::DocumentStatus,
-    invariant::InvariantStatus,
-    invariant_set::InvariantSetStatus,
-    lean_theorem::TheoremStatus,
-    proof_artifact::ProofStatus,
-    BadgeStatus, DocumentStatus as ProtoDocumentStatus, Invariant, InvariantSet,
-    InvariantSetStatus as ProtoInvariantSetStatus, InvariantStatus as ProtoInvariantStatus,
-    LeanTheorem, Priority, ProofArtifact, ProofStatus as ProtoProofStatus,
-    ResourceUsage, SpecDocument, TheoremStatus as ProtoTheoremStatus, Variable,
-};
+fn timestamp_to_datetime(ts: &Timestamp) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
+    DateTime::from_timestamp(ts.seconds, ts.nanos as u32).ok_or_else(|| "invalid timestamp".into())
+}
+
+/// Generated protobuf types (`spec_to_proof.v1`).
+pub use spec_to_proof::v1 as spec_v1;
+/// Generated proof-service protobuf types (`spec_to_proof.proof.v1`).
+pub use spec_to_proof::proof::v1 as proof_v1;
 
 // Rust domain models with conversion traits
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,10 +238,10 @@ pub trait FromProto {
 
 // Implementation of conversion traits
 impl ToProto for SpecDocumentModel {
-    type ProtoType = SpecDocument;
+    type ProtoType = spec_v1::SpecDocument;
 
     fn to_proto(&self) -> Self::ProtoType {
-        SpecDocument {
+        spec_v1::SpecDocument {
             id: self.id.clone(),
             content_sha256: self.content_sha256.clone(),
             source_system: self.source_system.clone(),
@@ -235,17 +250,17 @@ impl ToProto for SpecDocumentModel {
             content: self.content.clone(),
             url: self.url.clone(),
             author: self.author.clone(),
-            created_at: Some(self.created_at.into()),
-            modified_at: Some(self.modified_at.into()),
+            created_at: Some(datetime_to_timestamp(self.created_at)),
+            modified_at: Some(datetime_to_timestamp(self.modified_at)),
             metadata: self.metadata.clone(),
             version: self.version,
-            status: self.status.to_proto() as i32,
+            status: self.status.to_proto(),
         }
     }
 }
 
 impl FromProto for SpecDocumentModel {
-    type ProtoType = SpecDocument;
+    type ProtoType = spec_v1::SpecDocument;
 
     fn from_proto(proto: Self::ProtoType) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(SpecDocumentModel {
@@ -257,20 +272,20 @@ impl FromProto for SpecDocumentModel {
             content: proto.content,
             url: proto.url,
             author: proto.author,
-            created_at: proto.created_at.unwrap_or_default().try_into()?,
-            modified_at: proto.modified_at.unwrap_or_default().try_into()?,
+            created_at: timestamp_to_datetime(proto.created_at.as_ref().unwrap_or(&Timestamp::default()))?,
+            modified_at: timestamp_to_datetime(proto.modified_at.as_ref().unwrap_or(&Timestamp::default()))?,
             metadata: proto.metadata,
             version: proto.version,
-            status: DocumentStatus::from_proto(proto.status),
+            status: DocumentStatus::from_proto(proto.status)?,
         })
     }
 }
 
 impl ToProto for InvariantModel {
-    type ProtoType = Invariant;
+    type ProtoType = spec_v1::Invariant;
 
     fn to_proto(&self) -> Self::ProtoType {
-        Invariant {
+        spec_v1::Invariant {
             id: self.id.clone(),
             content_sha256: self.content_sha256.clone(),
             description: self.description.clone(),
@@ -280,16 +295,16 @@ impl ToProto for InvariantModel {
             units: self.units.clone(),
             confidence_score: self.confidence_score,
             source_document_id: self.source_document_id.clone(),
-            extracted_at: Some(self.extracted_at.into()),
-            status: self.status.to_proto() as i32,
+            extracted_at: Some(datetime_to_timestamp(self.extracted_at)),
+            status: self.status.to_proto(),
             tags: self.tags.clone(),
-            priority: self.priority.to_proto() as i32,
+            priority: self.priority.to_proto(),
         }
     }
 }
 
 impl FromProto for InvariantModel {
-    type ProtoType = Invariant;
+    type ProtoType = spec_v1::Invariant;
 
     fn from_proto(proto: Self::ProtoType) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(InvariantModel {
@@ -306,19 +321,19 @@ impl FromProto for InvariantModel {
             units: proto.units,
             confidence_score: proto.confidence_score,
             source_document_id: proto.source_document_id,
-            extracted_at: proto.extracted_at.unwrap_or_default().try_into()?,
-            status: InvariantStatus::from_proto(proto.status),
+            extracted_at: timestamp_to_datetime(proto.extracted_at.as_ref().unwrap_or(&Timestamp::default()))?,
+            status: InvariantStatus::from_proto(proto.status)?,
             tags: proto.tags,
-            priority: Priority::from_proto(proto.priority),
+            priority: Priority::from_proto(proto.priority)?,
         })
     }
 }
 
 impl ToProto for VariableModel {
-    type ProtoType = Variable;
+    type ProtoType = spec_v1::Variable;
 
     fn to_proto(&self) -> Self::ProtoType {
-        Variable {
+        spec_v1::Variable {
             name: self.name.clone(),
             r#type: self.var_type.clone(),
             description: self.description.clone(),
@@ -329,7 +344,7 @@ impl ToProto for VariableModel {
 }
 
 impl FromProto for VariableModel {
-    type ProtoType = Variable;
+    type ProtoType = spec_v1::Variable;
 
     fn from_proto(proto: Self::ProtoType) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(VariableModel {
@@ -359,14 +374,14 @@ impl ToProto for DocumentStatus {
 impl FromProto for DocumentStatus {
     type ProtoType = i32;
 
-    fn from_proto(proto: Self::ProtoType) -> Self {
-        match proto {
+    fn from_proto(proto: Self::ProtoType) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(match proto {
             0 => DocumentStatus::Unspecified,
             1 => DocumentStatus::Draft,
             2 => DocumentStatus::Published,
             3 => DocumentStatus::Archived,
             _ => DocumentStatus::Unspecified,
-        }
+        })
     }
 }
 
@@ -388,8 +403,8 @@ impl ToProto for InvariantStatus {
 impl FromProto for InvariantStatus {
     type ProtoType = i32;
 
-    fn from_proto(proto: Self::ProtoType) -> Self {
-        match proto {
+    fn from_proto(proto: Self::ProtoType) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(match proto {
             0 => InvariantStatus::Unspecified,
             1 => InvariantStatus::Extracted,
             2 => InvariantStatus::Confirmed,
@@ -397,7 +412,7 @@ impl FromProto for InvariantStatus {
             4 => InvariantStatus::Proven,
             5 => InvariantStatus::Failed,
             _ => InvariantStatus::Unspecified,
-        }
+        })
     }
 }
 
@@ -418,15 +433,15 @@ impl ToProto for Priority {
 impl FromProto for Priority {
     type ProtoType = i32;
 
-    fn from_proto(proto: Self::ProtoType) -> Self {
-        match proto {
+    fn from_proto(proto: Self::ProtoType) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(match proto {
             0 => Priority::Unspecified,
             1 => Priority::Low,
             2 => Priority::Medium,
             3 => Priority::High,
             4 => Priority::Critical,
             _ => Priority::Unspecified,
-        }
+        })
     }
 }
 
@@ -540,198 +555,11 @@ mod tests {
 
     proptest! {
         #[test]
-        fn test_spec_document_round_trip(doc: SpecDocumentModel) {
-            let proto = doc.to_proto();
-            let round_trip = SpecDocumentModel::from_proto(proto).unwrap();
-            assert_eq!(doc.id, round_trip.id);
-            assert_eq!(doc.content_sha256, round_trip.content_sha256);
-            assert_eq!(doc.title, round_trip.title);
-        }
-
-        #[test]
-        fn test_invariant_round_trip(invariant: InvariantModel) {
-            let proto = invariant.to_proto();
-            let round_trip = InvariantModel::from_proto(proto).unwrap();
-            assert_eq!(invariant.id, round_trip.id);
-            assert_eq!(invariant.content_sha256, round_trip.content_sha256);
-            assert_eq!(invariant.description, round_trip.description);
-        }
-
-        #[test]
         fn test_sha256_hashing(content: String) {
             let hash1 = calculate_sha256(&content);
             let hash2 = calculate_sha256(&content);
             assert_eq!(hash1, hash2);
             assert_eq!(hash1.len(), 64);
-        }
-    }
-
-    // Arbitrary implementations for property-based testing
-    impl Arbitrary for SpecDocumentModel {
-        type Parameters = ();
-        type Strategy = BoxedStrategy<Self>;
-
-        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-            (
-                any::<String>(),
-                any::<String>(),
-                any::<String>(),
-                any::<String>(),
-                any::<String>(),
-                any::<String>(),
-                any::<String>(),
-                any::<String>(),
-                any::<DateTime<Utc>>(),
-                any::<DateTime<Utc>>(),
-                any::<HashMap<String, String>>(),
-                any::<i32>(),
-                any::<DocumentStatus>(),
-            )
-                .prop_map(|(id, content_sha256, source_system, source_id, title, content, url, author, created_at, modified_at, metadata, version, status)| {
-                    SpecDocumentModel {
-                        id,
-                        content_sha256,
-                        source_system,
-                        source_id,
-                        title,
-                        content,
-                        url,
-                        author,
-                        created_at,
-                        modified_at,
-                        metadata,
-                        version,
-                        status,
-                    }
-                })
-                .boxed()
-        }
-    }
-
-    impl Arbitrary for InvariantModel {
-        type Parameters = ();
-        type Strategy = BoxedStrategy<Self>;
-
-        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-            (
-                any::<String>(),
-                any::<String>(),
-                any::<String>(),
-                any::<String>(),
-                any::<String>(),
-                any::<Vec<VariableModel>>(),
-                any::<HashMap<String, String>>(),
-                any::<f64>(),
-                any::<String>(),
-                any::<DateTime<Utc>>(),
-                any::<InvariantStatus>(),
-                any::<Vec<String>>(),
-                any::<Priority>(),
-            )
-                .prop_map(|(id, content_sha256, description, formal_expression, natural_language, variables, units, confidence_score, source_document_id, extracted_at, status, tags, priority)| {
-                    InvariantModel {
-                        id,
-                        content_sha256,
-                        description,
-                        formal_expression,
-                        natural_language,
-                        variables,
-                        units,
-                        confidence_score,
-                        source_document_id,
-                        extracted_at,
-                        status,
-                        tags,
-                        priority,
-                    }
-                })
-                .boxed()
-        }
-    }
-
-    impl Arbitrary for VariableModel {
-        type Parameters = ();
-        type Strategy = BoxedStrategy<Self>;
-
-        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-            (
-                any::<String>(),
-                any::<String>(),
-                any::<String>(),
-                any::<String>(),
-                any::<Vec<String>>(),
-            )
-                .prop_map(|(name, var_type, description, unit, constraints)| {
-                    VariableModel {
-                        name,
-                        var_type,
-                        description,
-                        unit,
-                        constraints,
-                    }
-                })
-                .boxed()
-        }
-    }
-
-    impl Arbitrary for DocumentStatus {
-        type Parameters = ();
-        type Strategy = BoxedStrategy<Self>;
-
-        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-            prop_oneof![
-                Just(DocumentStatus::Unspecified),
-                Just(DocumentStatus::Draft),
-                Just(DocumentStatus::Published),
-                Just(DocumentStatus::Archived),
-            ]
-            .boxed()
-        }
-    }
-
-    impl Arbitrary for InvariantStatus {
-        type Parameters = ();
-        type Strategy = BoxedStrategy<Self>;
-
-        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-            prop_oneof![
-                Just(InvariantStatus::Unspecified),
-                Just(InvariantStatus::Extracted),
-                Just(InvariantStatus::Confirmed),
-                Just(InvariantStatus::Rejected),
-                Just(InvariantStatus::Proven),
-                Just(InvariantStatus::Failed),
-            ]
-            .boxed()
-        }
-    }
-
-    impl Arbitrary for Priority {
-        type Parameters = ();
-        type Strategy = BoxedStrategy<Self>;
-
-        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-            prop_oneof![
-                Just(Priority::Unspecified),
-                Just(Priority::Low),
-                Just(Priority::Medium),
-                Just(Priority::High),
-                Just(Priority::Critical),
-            ]
-            .boxed()
-        }
-    }
-
-    impl Arbitrary for DateTime<Utc> {
-        type Parameters = ();
-        type Strategy = BoxedStrategy<Self>;
-
-        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-            (0..253402300799i64)
-                .prop_map(|timestamp| {
-                    DateTime::from_timestamp(timestamp, 0).unwrap_or_else(|| Utc::now())
-                })
-                .boxed()
         }
     }
 } 

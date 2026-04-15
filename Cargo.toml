@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "proto",
+    "nlp",
+    "proof",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"

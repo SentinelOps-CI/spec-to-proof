@@ -116,7 +116,10 @@ async fn poll_and_publish(
     let token = OAuth2Token {
         access_token: "mock_access_token".to_string(),
         refresh_token: oauth_credentials.client_secret,
-        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        expires_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64 + 3600)
+            .unwrap_or(0),
         token_type: "Bearer".to_string(),
     };
 

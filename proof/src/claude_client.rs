@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::error::Error;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -42,6 +41,7 @@ struct ClaudeResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeContent {
     #[serde(rename = "type")]
     content_type: String,
@@ -50,6 +50,7 @@ struct ClaudeContent {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeToolCall {
     id: String,
     #[serde(rename = "type")]

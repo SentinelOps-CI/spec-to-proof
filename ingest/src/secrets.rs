@@ -57,7 +57,7 @@ impl SecretsManager {
 
         // Encrypt the credentials with the data key
         let credentials_json = serde_json::to_vec(credentials)?;
-        let encrypted_data = self.encrypt_with_key(&credentials_json, plaintext_key)?;
+        let encrypted_data = self.encrypt_with_key(&credentials_json, plaintext_key.as_ref())?;
 
         // Create the encrypted secret structure
         let encrypted_secret = EncryptedSecret {
@@ -108,7 +108,8 @@ impl SecretsManager {
             .ok_or("No decrypted key returned")?;
 
         // Decrypt the credentials
-        let decrypted_data = self.decrypt_with_key(&encrypted_secret.encrypted_data, decrypted_key)?;
+        let decrypted_data =
+            self.decrypt_with_key(&encrypted_secret.encrypted_data, decrypted_key.as_ref())?;
         let credentials: OAuth2Credentials = serde_json::from_slice(&decrypted_data)?;
 
         Ok(credentials)
@@ -150,7 +151,7 @@ impl SecretsManager {
 
         let secret_names = response
             .secret_list()
-            .unwrap_or_default()
+            .unwrap_or(&[])
             .iter()
             .map(|secret| secret.name().unwrap_or_default().to_string())
             .collect();

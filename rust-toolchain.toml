@@ -1,0 +1,5 @@
+[toolchain]
+# AWS SDK 1.x releases require a recent compiler; keep in sync with CI.
+channel = "1.91.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

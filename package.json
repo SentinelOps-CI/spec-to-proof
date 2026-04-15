@@ -4,12 +4,12 @@
   "description": "Turns everyday product specs into machine-checked Lean 4 guarantees",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint",
+    "dev": "node scripts/run-in-platform-ui.mjs dev",
+    "build": "node scripts/run-in-platform-ui.mjs build",
+    "start": "node scripts/run-in-platform-ui.mjs start",
+    "lint": "node scripts/run-in-platform-ui.mjs lint",
     "format": "prettier --write .",
-    "type-check": "tsc --noEmit",
+    "type-check": "node scripts/run-in-platform-ui.mjs type-check",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage"
@@ -74,23 +74,12 @@
       "^@/components/(.*)$": "<rootDir>/platform/ui/src/components/$1"
     },
     "transform": {
-<<<<<<< Current (Your changes)
-      "^.+\\.(ts|tsx)$": ["ts-jest", {
-        "tsconfig": "platform/ui/tsconfig.jest.json"
-      }]
-=======
       "^.+\\.(ts|tsx)$": [
         "ts-jest",
         {
-          "tsconfig": {
-            "jsx": "react-jsx",
-            "esModuleInterop": true,
-            "allowSyntheticDefaultImports": true,
-            "moduleResolution": "node"
-          }
+          "tsconfig": "platform/ui/tsconfig.jest.json"
         }
       ]
->>>>>>> Incoming (Background Agent changes)
     },
     "testMatch": [
       "**/__tests__/**/*.(ts|tsx)",

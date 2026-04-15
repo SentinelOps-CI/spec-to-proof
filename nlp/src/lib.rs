@@ -6,18 +6,16 @@ pub mod pii_redactor;
 pub mod prompts;
 pub mod proto;
 
-use std::collections::HashMap;
-use std::error::Error;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use aws_sdk_dynamodb::Client as DynamoClient;
-use regex::Regex;
 
 use crate::proto::nlp::v1::{
     ExtractInvariantsRequest, ExtractInvariantsResponse, ExtractedInvariant,
-    Variable, Priority, TokenUsage, ProcessingMetadata, ExtractionMetadata,
-    HealthCheckRequest, HealthCheckResponse
+    ProcessingMetadata, ExtractionMetadata,
+    HealthCheckRequest, HealthCheckResponse,
 };
 
 use crate::claude_client::ClaudeClient;
@@ -56,6 +54,8 @@ impl Default for InvariantExtractionConfig {
 
 pub struct NlpService {
     config: InvariantExtractionConfig,
+    /// Reserved for future direct Claude calls from this service layer.
+    #[allow(dead_code)]
     claude_client: ClaudeClient,
     extractor: InvariantExtractor,
     cache: DynamoCache,
@@ -67,7 +67,7 @@ impl NlpService {
     pub async fn new(
         config: InvariantExtractionConfig,
         dynamo_client: DynamoClient,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self> {
         let claude_client = ClaudeClient::new(&config.claude_api_key, &config.claude_model);
         let extractor = InvariantExtractor::new(&config);
         let cache = DynamoCache::new(dynamo_client, &config);
@@ -87,7 +87,7 @@ impl NlpService {
     pub async fn extract_invariants(
         &self,
         request: ExtractInvariantsRequest,
-    ) -> Result<ExtractInvariantsResponse, Box<dyn Error>> {
+    ) -> Result<ExtractInvariantsResponse> {
         let start_time = Instant::now();
         
         // Generate cache key from document content
@@ -123,7 +123,7 @@ impl NlpService {
         let response = ExtractInvariantsResponse {
             invariants: filtered_invariants,
             token_usage: extraction_result.token_usage,
-            metadata: ProcessingMetadata::default(),
+            metadata: None,
         };
 
         // Cache the result
@@ -148,17 +148,21 @@ impl NlpService {
                 ],
                 retry_count: 0,
                 pii_detected,
-                redacted_fields,
+                redacted_fields: redacted_fields.clone(),
             });
         }
 
         Ok(response_with_metadata)
     }
 
+    pub async fn ensure_cache_table_exists(&self) -> Result<()> {
+        self.cache.ensure_table_exists().await
+    }
+
     pub async fn health_check(
         &self,
         _request: HealthCheckRequest,
-    ) -> Result<HealthCheckResponse, Box<dyn Error>> {
+    ) -> Result<HealthCheckResponse> {
         Ok(HealthCheckResponse {
             status: "healthy".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -189,13 +193,13 @@ impl NlpService {
         cached: bool,
         cache_key: &str,
     ) -> ExtractInvariantsResponse {
-        response.metadata = ProcessingMetadata {
+        response.metadata = Some(ProcessingMetadata {
             processed_at: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
             model_used: self.config.claude_model.clone(),
             duration_ms: start_time.elapsed().as_millis() as i64,
             cached,
             cache_key: cache_key.to_string(),
-        };
+        });
         response
     }
 }
@@ -203,11 +207,10 @@ impl NlpService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio;
 
     #[tokio::test]
     async fn test_nlp_service_creation() {
-        let config = InvariantExtractionConfig::default();
+        let _config = InvariantExtractionConfig::default();
         // This would need a mock DynamoDB client in a real test
         // let service = NlpService::new(config, mock_dynamo_client).await;
         // assert!(service.is_ok());

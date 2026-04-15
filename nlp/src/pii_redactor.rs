@@ -136,6 +136,12 @@ impl PiiRedactor {
     }
 }
 
+impl Default for PiiRedactor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

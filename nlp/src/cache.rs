@@ -1,7 +1,10 @@
-use std::error::Error;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Result};
 use aws_sdk_dynamodb::Client as DynamoClient;
 use aws_sdk_dynamodb::types::{AttributeValue, ScalarAttributeType, BillingMode};
+use base64::Engine;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use crate::proto::nlp::v1::ExtractInvariantsResponse;
 use crate::InvariantExtractionConfig;
@@ -15,7 +18,8 @@ pub struct DynamoCache {
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEntry {
     cache_key: String,
-    response: ExtractInvariantsResponse,
+    /// Base64-encoded `ExtractInvariantsResponse` protobuf.
+    response_b64: String,
     created_at: u64,
     expires_at: u64,
 }
@@ -29,7 +33,7 @@ impl DynamoCache {
         }
     }
 
-    pub async fn get(&self, cache_key: &str) -> Result<Option<ExtractInvariantsResponse>, Box<dyn Error>> {
+    pub async fn get(&self, cache_key: &str) -> Result<Option<ExtractInvariantsResponse>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -58,8 +62,14 @@ impl DynamoCache {
                                 // Cache hit and not expired
                                 if let Ok(response_json) = response_attr.as_s() {
                                     if let Ok(cache_entry) = serde_json::from_str::<CacheEntry>(response_json) {
-                                        tracing::info!("Cache hit for key: {}", cache_key);
-                                        return Ok(Some(cache_entry.response));
+                                        if let Ok(bytes) =
+                                            base64::engine::general_purpose::STANDARD.decode(&cache_entry.response_b64)
+                                        {
+                                            if let Ok(parsed) = ExtractInvariantsResponse::decode(&bytes[..]) {
+                                                tracing::info!("Cache hit for key: {}", cache_key);
+                                                return Ok(Some(parsed));
+                                            }
+                                        }
                                     }
                                 }
                             } else {
@@ -75,7 +85,7 @@ impl DynamoCache {
         Ok(None)
     }
 
-    pub async fn set(&self, cache_key: &str, response: &ExtractInvariantsResponse) -> Result<(), Box<dyn Error>> {
+    pub async fn set(&self, cache_key: &str, response: &ExtractInvariantsResponse) -> Result<()> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -83,9 +93,13 @@ impl DynamoCache {
 
         let expires_at = now + self.ttl_seconds;
 
+        let mut buf = Vec::new();
+        response.encode(&mut buf)?;
+        let response_b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+
         let cache_entry = CacheEntry {
             cache_key: cache_key.to_string(),
-            response: response.clone(),
+            response_b64,
             created_at: now,
             expires_at,
         };
@@ -106,7 +120,7 @@ impl DynamoCache {
         Ok(())
     }
 
-    pub async fn delete(&self, cache_key: &str) -> Result<(), Box<dyn Error>> {
+    pub async fn delete(&self, cache_key: &str) -> Result<()> {
         self.client
             .delete_item()
             .table_name(&self.table_name)
@@ -118,7 +132,7 @@ impl DynamoCache {
         Ok(())
     }
 
-    pub async fn ensure_table_exists(&self) -> Result<(), Box<dyn Error>> {
+    pub async fn ensure_table_exists(&self) -> Result<()> {
         // Check if table exists
         match self.client
             .describe_table()
@@ -143,13 +157,13 @@ impl DynamoCache {
                 aws_sdk_dynamodb::types::AttributeDefinition::builder()
                     .attribute_name("cache_key")
                     .attribute_type(ScalarAttributeType::S)
-                    .build()
+                    .build()?,
             )
             .key_schema(
                 aws_sdk_dynamodb::types::KeySchemaElement::builder()
                     .attribute_name("cache_key")
                     .key_type(aws_sdk_dynamodb::types::KeyType::Hash)
-                    .build()
+                    .build()?,
             )
             .billing_mode(BillingMode::PayPerRequest)
             .send()
@@ -162,7 +176,7 @@ impl DynamoCache {
         Ok(())
     }
 
-    async fn wait_for_table_active(&self) -> Result<(), Box<dyn Error>> {
+    async fn wait_for_table_active(&self) -> Result<()> {
         let max_attempts = 30;
         let delay = Duration::from_secs(2);
 
@@ -192,10 +206,10 @@ impl DynamoCache {
             }
         }
 
-        Err("Table did not become active within expected time".into())
+        Err(anyhow!("Table did not become active within expected time"))
     }
 
-    pub async fn cleanup_expired(&self) -> Result<u32, Box<dyn Error>> {
+    pub async fn cleanup_expired(&self) -> Result<u32> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -214,7 +228,7 @@ impl DynamoCache {
         if let Some(items) = scan_response.items {
             for item in items {
                 if let Some(cache_key_attr) = item.get("cache_key") {
-                    if let Some(cache_key) = cache_key_attr.as_s().ok() {
+                    if let Ok(cache_key) = cache_key_attr.as_s() {
                         self.delete(cache_key).await?;
                         deleted_count += 1;
                     }
@@ -230,7 +244,8 @@ impl DynamoCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::nlp::v1::{ExtractInvariantsResponse, ExtractedInvariant, TokenUsage, ProcessingMetadata};
+    use crate::proto::nlp::v1::{ExtractInvariantsResponse, TokenUsage, ProcessingMetadata};
+    use prost::Message;
 
     #[tokio::test]
     async fn test_cache_entry_serialization() {
@@ -251,9 +266,13 @@ mod tests {
             }),
         };
 
+        let mut buf = Vec::new();
+        response.encode(&mut buf).unwrap();
+        let response_b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+
         let cache_entry = CacheEntry {
             cache_key: "test_key".to_string(),
-            response: response.clone(),
+            response_b64,
             created_at: 1234567890,
             expires_at: 1234567890 + 86400,
         };

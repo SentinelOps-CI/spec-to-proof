@@ -1,8 +1,8 @@
 use std::error::Error;
 use tonic::transport::Server;
-use tracing::{info, error};
+use tracing::info;
 
-use proof::lib::{ProofServiceImpl, ProofConfig};
+use proof::{ProofConfig, ProofServiceImpl};
 use proof::proto::proof::v1::proof_service_server::ProofServiceServer;
 
 #[tokio::main]
@@ -107,7 +107,9 @@ mod tests {
         std::env::remove_var("CLAUDE_API_KEY");
         
         let result = load_config();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("CLAUDE_API_KEY"));
+        match result {
+            Err(e) => assert!(e.to_string().contains("CLAUDE_API_KEY")),
+            Ok(_) => panic!("expected missing CLAUDE_API_KEY to fail"),
+        }
     }
 } 

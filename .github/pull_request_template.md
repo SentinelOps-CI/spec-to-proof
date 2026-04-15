@@ -1,113 +1,62 @@
 # Pull Request
 
-## Description
-Brief description of the changes made.
+## What changed
 
-## Type of Change
+Describe the change and the motivation in 2-5 bullet points.
+
+## Change type
+
 - [ ] Bug fix
-- [ ] New feature
+- [ ] Feature
+- [ ] Refactor
+- [ ] Documentation
+- [ ] Security
 - [ ] Breaking change
-- [ ] Documentation update
-- [ ] Performance improvement
-- [ ] Security fix
 
-## Triple-Check Policy Compliance
+## Validation performed
 
-### ✅ Automated Review
-- [ ] CI passes (lint + tests + proofs)
-- [ ] Static analysis passes (ESLint strict, Clippy deny warnings)
-- [ ] Security scans pass (cargo audit, Snyk)
-- [ ] Coverage > 90%
-- [ ] Mutation score > 85%
+Paste the commands you ran and summarize outcomes.
 
-### ✅ Peer Review
-- [ ] Two senior reviewers assigned
-- [ ] Code review completed
-- [ ] All review comments addressed
-- [ ] Tests evidence provided below
-
-### ✅ Manual QA
-- [ ] `make smoke-qa` passes in clean Docker
-- [ ] Results attached to PR
-- [ ] No regressions introduced
-
-## Test Evidence
-
-### Unit Tests
 ```bash
-# Run unit tests
-bazel test //... --test_output=all
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+npm ci
+npm run lint
+npm run type-check
+npm test
 ```
 
-### Integration Tests
-```bash
-# Run integration tests
-bazel test //tests/... --test_output=all
-```
+If applicable:
 
-### E2E Tests
 ```bash
-# Run E2E tests
-bazel test //e2e/...
-```
-
-### Coverage Report
-```bash
-# Generate coverage
-bazel coverage //... --combined_report=lcov
-```
-
-### Security Scan Results
-```bash
-# Security audit
-cargo audit
+cd proof/lean && lake build
 cargo deny check
-npx snyk test --severity-threshold=high
+cargo audit
 ```
 
-### Lean Proof Verification
-```bash
-# Verify Lean proofs
-bazel build //proof/lean/...
-```
+## Risk and rollout
 
-## Performance Impact
-- [ ] No performance regression
-- [ ] Benchmarks updated if applicable
-- [ ] Load testing completed if needed
+- **Risk level**: low / medium / high
+- **Fallback plan**: how to revert or disable safely
+- **Data/compatibility impact**: migrations, API/contract changes, or none
 
-## Security Considerations
-- [ ] No new security vulnerabilities introduced
-- [ ] Input validation added where needed
-- [ ] Authentication/authorization reviewed
-- [ ] Secrets management reviewed
+## Security checklist
 
-## Documentation
-- [ ] README updated if needed
-- [ ] API documentation updated
-- [ ] Code comments added for complex logic
-- [ ] Architecture decisions documented
+- [ ] No secrets committed (`.env`, tokens, private keys, credentials)
+- [ ] Input validation and error handling reviewed
+- [ ] Dependency changes reviewed for supply-chain risk
+- [ ] Relevant threat surface considered (authz, data exposure, injection)
 
-## Breaking Changes
-- [ ] Breaking changes documented
-- [ ] Migration guide provided if needed
-- [ ] Version bump planned
+## Documentation checklist
 
-## Checklist
-- [ ] Code follows project style guidelines
-- [ ] Self-review completed
-- [ ] All tests pass locally
-- [ ] No console errors or warnings
-- [ ] Error handling implemented
-- [ ] Logging added where appropriate
-- [ ] Dependencies updated if needed
-- [ ] No sensitive data in logs or comments
+- [ ] Updated docs for behavior/config changes (`README`, `CONTRIBUTING`, ADRs)
+- [ ] Added or updated tests for the changed behavior
 
-## Related Issues
-Closes #(issue number)
+## Linked issues
 
-## Screenshots (if applicable)
-Add screenshots for UI changes.
+Closes #(issue)
 
-## Additional Notes
-Any additional information or context. 
+## Screenshots / logs (if relevant)
+
+Include UI screenshots or terminal output snippets when they improve review clarity.

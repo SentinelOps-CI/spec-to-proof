@@ -3,7 +3,7 @@ use crate::{
     rate_limiter::RateLimiter, backoff::ExponentialBackoff,
 };
 use crate::proto::spec_to_proof::v1::SpecDocument;
-use crate::proto::google::protobuf::Timestamp;
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -275,16 +275,10 @@ impl ConfluenceConnector {
         format!("{:x}", hasher.finalize())
     }
 
-    fn parse_timestamp(&self, timestamp_str: &str) -> Result<Timestamp, Box<dyn std::error::Error>> {
+    fn parse_timestamp(&self, timestamp_str: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
         // Confluence timestamps are in format: "2023-01-01T12:00:00.000Z"
         let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp_str)?;
-        let seconds = timestamp.timestamp();
-        let nanos = timestamp.timestamp_subsec_nanos() as i32;
-        
-        Ok(Timestamp {
-            seconds,
-            nanos,
-        })
+        Ok(timestamp.with_timezone(&Utc))
     }
 
     fn parse_confluence_timestamp(&self, timestamp_str: &str) -> Result<i64, Box<dyn std::error::Error>> {

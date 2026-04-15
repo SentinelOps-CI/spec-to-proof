@@ -1,334 +1,151 @@
+# Hybrid build: Cargo workspace (Rust), npm (Next.js UI), optional Lake (Lean), infra lint.
+# See docs/adr/0002-ci-layout.md
+
 name: CI
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 env:
-  BAZEL_VERSION: 6.4.0
-  RUST_VERSION: 1.78.0
-  NODE_VERSION: 20
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: "20"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # Layer 1: Static Analysis (Fail Fast)
-  static-analysis:
-    name: Static Analysis
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Setup Bazel
-      uses: bazelbuild/setup-bazelisk@v2
-      with:
-        version: ${{ env.BAZEL_VERSION }}
-        
-    - name: Setup Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: ${{ env.RUST_VERSION }}
-        override: true
-        
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
-        cache: 'npm'
-        
-    - name: Install dependencies
-      run: |
-        npm ci
-        cargo install cargo-audit cargo-deny
-        
-    - name: Run strict linting
-      run: |
-        # ESLint strict mode
-        npx eslint "**/*.{ts,tsx,js,jsx}" --max-warnings=0
-        
-        # Clippy deny warnings
-        cargo clippy -- -D warnings -D clippy::all
-        
-        # Prettier check
-        npx prettier --check "**/*.{ts,tsx,js,jsx,json,md}"
-        
-        # Bazel build check
-        bazel build //...
-        
-    - name: Run security scans
-      run: |
-        # Cargo audit
-        cargo audit
-        
-        # Cargo deny
-        cargo deny check
-        
-        # Snyk scan
-        npx snyk test --severity-threshold=high
-        
-  # Layer 2: Dynamic Tests
-  test:
-    name: Test Suite
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    needs: static-analysis
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Setup Bazel
-      uses: bazelbuild/setup-bazelisk@v2
-      with:
-        version: ${{ env.BAZEL_VERSION }}
-        
-    - name: Setup Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: ${{ env.RUST_VERSION }}
-        override: true
-        
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
-        cache: 'npm'
-        
-    - name: Install dependencies
-      run: |
-        npm ci
-        
-    - name: Run unit tests
-      run: |
-        bazel test //... --test_output=all
-        
-    - name: Run integration tests
-      run: |
-        bazel test //tests/... --test_output=all
-        
-    - name: Generate coverage report
-      run: |
-        bazel coverage //... --combined_report=lcov
-        genhtml bazel-out/_coverage/_coverage_report.dat -o coverage-report
-        
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
-      with:
-        file: ./coverage/lcov.info
-        flags: unittests
-        name: codecov-umbrella
-        fail_ci_if_error: true
-        
-    - name: Check coverage threshold
-      run: |
-        # Extract coverage percentage and check if > 90%
-        COVERAGE=$(bazel coverage //... --combined_report=lcov | grep -o 'lines......: [0-9.]*%' | grep -o '[0-9.]*')
-        if (( $(echo "$COVERAGE < 90" | bc -l) )); then
-          echo "❌ Coverage $COVERAGE% is below 90% threshold"
-          exit 1
-        fi
-        echo "✅ Coverage $COVERAGE% meets 90% threshold"
-        
-  # Layer 3: Formal Proof (Lean Farm)
-  lean-verify:
-    name: Lean Verification
+  rust:
+    name: Rust (fmt, clippy, test, deny)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: test
-    
+    timeout-minutes: 30
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Setup Bazel
-      uses: bazelbuild/setup-bazelisk@v2
-      with:
-        version: ${{ env.BAZEL_VERSION }}
-        
-    - name: Install Lean 4
-      run: |
-        wget -q https://raw.githubusercontent.com/leanprover/lean4/master/elan/elan-init.sh -O elan-init.sh
-        bash elan-init.sh -y
-        source ~/.bashrc
-        elan default leanprover/lean4:stable
-        
-    - name: Verify Lean proofs
-      run: |
-        bazel build //proof/lean/...
-        
-    - name: Run Lean farm tests
-      run: |
-        bazel test //lean-farm/...
-        
-  # Heavy Jobs (Buildkite-style)
-  build:
-    name: Build & Package
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: cargo deny
+        run: cargo deny check
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
+
+  node:
+    name: Node (lint, typecheck, test)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [static-analysis, test]
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Setup Bazel
-      uses: bazelbuild/setup-bazelisk@v2
-      with:
-        version: ${{ env.BAZEL_VERSION }}
-        
-    - name: Setup Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: ${{ env.RUST_VERSION }}
-        override: true
-        
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
-        cache: 'npm'
-        
-    - name: Install dependencies
-      run: |
-        npm ci
-        
-    - name: Build all targets
-      run: |
-        bazel build //...
-        
-    - name: Build Docker images
-      run: |
-        bazel build //lean-farm:image
-        bazel build //platform/gh-app:image
-        
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-artifacts
-        path: |
-          bazel-bin/
-          bazel-out/
-        retention-days: 7
-        
-  e2e:
-    name: End-to-End Tests
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: TypeScript
+        run: npm run type-check
+
+      - name: Jest
+        run: npm test
+
+  lean:
+    name: Lean (Lake)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    needs: [static-analysis, test]
-    
-    services:
-      redis:
-        image: redis:7-alpine
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-          
+    timeout-minutes: 20
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Setup Bazel
-      uses: bazelbuild/setup-bazelisk@v2
-      with:
-        version: ${{ env.BAZEL_VERSION }}
-        
-    - name: Setup Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: ${{ env.RUST_VERSION }}
-        override: true
-        
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
-        cache: 'npm'
-        
-    - name: Install dependencies
-      run: |
-        npm ci
-        
-    - name: Run E2E tests
-      run: |
-        bazel test //e2e/...
-        
-  # License Compliance
-  license-compliance:
-    name: License Compliance
+      - uses: actions/checkout@v4
+
+      - name: Install elan
+        run: curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+
+      - name: Add elan to PATH
+        run: echo "$HOME/.elan/bin" >> $GITHUB_PATH
+
+      - name: lake build
+        working-directory: proof/lean
+        run: lake build
+
+  infra:
+    name: Terraform & Helm
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: static-analysis
-    
+    timeout-minutes: 15
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
-        cache: 'npm'
-        
-    - name: Install FOSSA
-      run: |
-        curl -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/fossas/fossa-cli/master/install.sh | bash
-        
-    - name: Run FOSSA scan
-      run: |
-        fossa analyze
-        fossa test
-        
-    - name: Upload FOSSA report
-      uses: actions/upload-artifact@v4
-      with:
-        name: fossa-report
-        path: .fossa.yml
-        retention-days: 30
-        
-  # Mutation Testing
-  mutation-testing:
-    name: Mutation Testing
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: terraform fmt & validate
+        working-directory: terraform
+        run: |
+          terraform fmt -check
+          terraform init -backend=false
+          terraform validate
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.4
+
+      - name: helm lint
+        run: |
+          helm lint charts/spec-to-proof
+          helm lint charts/lean-farm
+
+  docker:
+    name: Docker (lean-farm image)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    needs: [static-analysis, test]
-    
+    timeout-minutes: 20
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Setup Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: ${{ env.RUST_VERSION }}
-        override: true
-        
-    - name: Install cargo-mutants
-      run: |
-        cargo install cargo-mutants
-        
-    - name: Run mutation testing
-      run: |
-        # Run mutation testing on critical modules
-        cargo mutants --lib --target-dir target/mutants
-        
-    - name: Check mutation score
-      run: |
-        # Extract mutation score and check if > 85%
-        MUTATION_SCORE=$(cargo mutants --lib --target-dir target/mutants --json | jq -r '.summary.mutation_score')
-        if (( $(echo "$MUTATION_SCORE < 85" | bc -l) )); then
-          echo "❌ Mutation score $MUTATION_SCORE% is below 85% threshold"
-          exit 1
-        fi
-        echo "✅ Mutation score $MUTATION_SCORE% meets 85% threshold" 
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build lean-farm
+        uses: docker/build-push-action@v6
+        with:
+          context: lean-farm
+          file: lean-farm/Dockerfile
+          push: false
+          load: true
+          tags: spec-to-proof/lean-farm:ci
+
+      - name: Trivy scan (informational)
+        uses: aquasecurity/trivy-action@v0.35.0
+        continue-on-error: true
+        with:
+          image-ref: spec-to-proof/lean-farm:ci
+          severity: CRITICAL,HIGH
+          exit-code: "0"

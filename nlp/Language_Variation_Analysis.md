@@ -2,6 +2,8 @@
 
 The Spec-to-Proof system is designed to handle language variations in specifications while maintaining semantic consistency. This document explains how the system achieves this and provides detailed examples.
 
+Note: examples in this document are illustrative normalization outcomes used for design discussion; exact extraction output depends on model version, prompt revisions, and post-processing rules.
+
 ## Core Problem
 
 When multiple authors write specifications for the same system, they often use different:

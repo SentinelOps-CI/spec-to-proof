@@ -1,0 +1,30 @@
+[package]
+name = "ingest"
+version = "0.1.0"
+edition = "2021"
+description = "Spec document ingestion connectors (Jira, Confluence, Google Docs)"
+
+[dependencies]
+spec-to-proof-proto = { path = "../proto" }
+tokio = { version = "1", features = ["full", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aws-config = "~1.5"
+aws-sdk-secretsmanager = "~1.40"
+aws-sdk-kms = "~1.40"
+nats = "0.26"
+tracing = "0.1"
+prost = "0.12"
+prost-types = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.11", features = ["json"] }
+rand = "0.8"
+aes-gcm = "0.10"
+sha2 = "0.10"
+
+[[bin]]
+name = "jira_connector"
+path = "src/bin/jira_connector.rs"
+
+[dev-dependencies]
+wiremock = "0.5"

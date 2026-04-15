@@ -7,9 +7,11 @@ use sha2::{Sha256, Digest};
 use crate::claude_client::ClaudeClient;
 use crate::proto::proof::v1::*;
 use crate::proto::spec_to_proof::v1::*;
+use crate::ProofConfig;
 
 pub struct LeanCompiler {
     claude_client: ClaudeClient,
+    #[allow(dead_code)] // Retained for planned compiler features using full config.
     config: ProofConfig,
 }
 
@@ -89,8 +91,9 @@ impl LeanCompiler {
         let start_time = Instant::now();
         
         // Generate proof using Claude
+        let strategy = theorem.proof_strategy.clone();
         let (proof_code, input_tokens, output_tokens) = self.claude_client
-            .generate_proof(&theorem.lean_code, &options.proof_strategy, options.seed)
+            .generate_proof(&theorem.lean_code, &strategy, options.seed)
             .await?;
 
         // Parse the proof response
@@ -111,7 +114,7 @@ impl LeanCompiler {
         metadata.insert("proof_input_tokens".to_string(), input_tokens.to_string());
         metadata.insert("proof_output_tokens".to_string(), output_tokens.to_string());
         metadata.insert("proof_generation_time_ms".to_string(), start_time.elapsed().as_millis().to_string());
-        metadata.insert("proof_strategy".to_string(), options.proof_strategy.clone());
+        metadata.insert("proof_strategy".to_string(), strategy.clone());
         metadata.insert("attempts".to_string(), "1".to_string());
         
         if let Some(tactics) = parsed_proof.get("tactics_used") {
@@ -132,7 +135,7 @@ impl LeanCompiler {
             invariant_id: theorem.source_invariant_id.clone(),
             status: ProofStatus::Success as i32,
             attempted_at: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
-            duration_ms: start_time.elapsed().as_millis() as u64,
+            duration_ms: start_time.elapsed().as_millis() as i64,
             output: proof_code,
             logs: vec!["Proof generated successfully".to_string()],
             resource_usage: Some(ResourceUsage {
@@ -141,7 +144,7 @@ impl LeanCompiler {
                 disk_bytes: 0,     // TODO: Track actual disk usage
                 network_bytes: 0,  // TODO: Track actual network usage
             }),
-            proof_strategy: options.proof_strategy.clone(),
+            proof_strategy: strategy,
             confidence_score: 1.0, // TODO: Implement confidence scoring
             metadata: HashMap::new(),
         };
@@ -165,7 +168,7 @@ impl LeanCompiler {
         if !invariant.variables.is_empty() {
             let var_strings: Vec<String> = invariant.variables
                 .iter()
-                .map(|v| format!("- {}: {} ({})", v.name, v.var_type, v.description))
+                .map(|v| format!("- {}: {} ({})", v.name, v.r#type, v.description))
                 .collect();
             parts.push(format!("Variables:\n{}", var_strings.join("\n")));
         }
@@ -217,7 +220,7 @@ impl LeanCompiler {
             ));
         }
         
-        Ok(Value::Object(result))
+        Ok(Value::Object(result.into_iter().collect()))
     }
 
     fn parse_proof_response(&self, proof_code: &str) -> Result<Value, Box<dyn Error>> {
@@ -238,7 +241,7 @@ impl LeanCompiler {
         let difficulty = self.estimate_difficulty(proof_code);
         result.insert("difficulty".to_string(), Value::String(difficulty));
         
-        Ok(Value::Object(result))
+        Ok(Value::Object(result.into_iter().collect()))
     }
 
     fn extract_theorem_name(&self, lean_code: &str) -> Option<String> {
@@ -334,7 +337,7 @@ mod tests {
             variables: vec![
                 Variable {
                     name: "x".to_string(),
-                    var_type: "Nat".to_string(),
+                    r#type: "Nat".to_string(),
                     description: "Natural number".to_string(),
                     unit: "".to_string(),
                     constraints: vec![],
@@ -417,10 +420,32 @@ mod tests {
         let easy_proof = "by simp";
         assert_eq!(compiler.estimate_difficulty(easy_proof), "easy");
         
-        let medium_proof = "by\n  simp\n  apply Nat.add_zero\n  exact rfl";
+        let medium_proof = r#"by
+  simp
+  apply Nat.add_zero
+  exact rfl
+  rw [add_assoc]
+  simp
+  apply add_comm
+  exact rfl
+  intro x
+  cases x
+  simp
+"#;
         assert_eq!(compiler.estimate_difficulty(medium_proof), "medium");
         
-        let hard_proof = "by\n  induction n with\n  | zero => simp\n  | succ n ih =>\n    simp\n    rw [ih]\n    simp";
+        // Nine distinct tactic tokens triggers the fallback "hard" bucket (tactic count > 8).
+        let hard_proof = r#"induction
+rw
+simp
+apply
+exact
+intro
+cases
+refine
+constructor
+split
+"#;
         assert_eq!(compiler.estimate_difficulty(hard_proof), "hard");
     }
 
@@ -432,8 +457,7 @@ mod tests {
         let content = "test content";
         let hash = compiler.compute_content_hash(content);
         
-        // SHA256 hash of "test content"
-        let expected = "a8fdc205a9f19cc1c9daea1b32e1342f441f42b602cf69d3c0c5ceb7cc1e49d7";
+        let expected = "6ae8a75555209fd6c44157c0aed8016e763ff435a19cf186f76863140143ff72";
         assert_eq!(hash, expected);
     }
 } 

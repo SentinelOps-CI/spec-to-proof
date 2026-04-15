@@ -6,14 +6,16 @@ pub mod proto;
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use futures_util::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::proto::proof::v1::proof_service_server::ProofService as ProofServiceTrait;
 use crate::proto::proof::v1::*;
 use crate::proto::spec_to_proof::v1::*;
 
+#[derive(Clone)]
 pub struct ProofConfig {
     pub claude_api_key: String,
     pub claude_model: String,
@@ -48,6 +50,7 @@ impl Default for ProofConfig {
 
 pub struct ProofServiceImpl {
     config: ProofConfig,
+    #[allow(dead_code)] // Wired for future direct Claude calls alongside the compiler.
     claude_client: claude_client::ClaudeClient,
     compiler: compiler::LeanCompiler,
     s3_storage: s3_storage::S3Storage,
@@ -116,12 +119,17 @@ impl ProofServiceImpl {
         tracing::info!("Generating proof for theorem {}", theorem.theorem_name);
 
         let mut attempts = 0;
-        let mut last_error = None;
+        let mut last_error: Option<String> = None;
 
         while attempts < options.max_attempts {
             attempts += 1;
             
-            match self.compiler.generate_proof(theorem, options).await {
+            match self
+                .compiler
+                .generate_proof(theorem, options)
+                .await
+                .map_err(|e| e.to_string())
+            {
                 Ok((proven_theorem, proof_artifact)) => {
                     let duration_ms = start_time.elapsed().as_millis() as u64;
                     
@@ -130,22 +138,23 @@ impl ProofServiceImpl {
                     
                     return Ok((proven_theorem, proof_artifact));
                 }
-                Err(e) => {
-                    last_error = Some(e);
-                    
+                Err(err_msg) => {
+                    last_error = Some(err_msg.clone());
+
                     if attempts < options.max_attempts {
-                        let delay = Duration::from_millis(
-                            (self.config.retry_delay_ms * (2_u64.pow(attempts as u32 - 1))) as u64
-                        );
+                        let delay_ms = self.config.retry_delay_ms.saturating_mul(2_u64.pow(
+                            attempts.saturating_sub(1),
+                        ));
+                        let delay = Duration::from_millis(delay_ms);
                         tracing::warn!("Proof attempt {} failed, retrying in {:?}: {}", 
-                            attempts, delay, last_error.as_ref().unwrap());
+                            attempts, delay, err_msg);
                         tokio::time::sleep(delay).await;
                     }
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| "All proof attempts failed".into()))
+        Err(last_error.unwrap_or_else(|| "All proof attempts failed".to_string()).into())
     }
 
     pub async fn stream_lean_code(
@@ -211,6 +220,9 @@ impl ProofServiceImpl {
 
 #[tonic::async_trait]
 impl ProofServiceTrait for ProofServiceImpl {
+    type StreamLeanCodeStream =
+        Pin<Box<dyn Stream<Item = Result<StreamLeanCodeResponse, Status>> + Send + 'static>>;
+
     async fn compile_invariant_set(
         &self,
         request: Request<CompileInvariantSetRequest>,
@@ -281,15 +293,13 @@ impl ProofServiceTrait for ProofServiceImpl {
     async fn stream_lean_code(
         &self,
         request: Request<StreamLeanCodeRequest>,
-    ) -> Result<Response<tonic::Streaming<StreamLeanCodeResponse>>, Status> {
+    ) -> Result<Response<Self::StreamLeanCodeStream>, Status> {
         let req = request.into_inner();
 
         match self.stream_lean_code(&req.theorem.unwrap(), &req.s3_config.unwrap(), &req.versioning.unwrap()).await {
             Ok(response) => {
-                // For now, return a single response. In a real implementation,
-                // this would stream the upload progress
-                let stream = tokio_stream::once(Ok(response));
-                Ok(Response::new(Box::pin(stream)))
+                let stream: Self::StreamLeanCodeStream = Box::pin(tokio_stream::once(Ok(response)));
+                Ok(Response::new(stream))
             }
             Err(e) => {
                 tracing::error!("Failed to stream Lean code: {}", e);

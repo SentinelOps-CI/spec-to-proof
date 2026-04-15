@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::error::Error;
 use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::types::{ServerSideEncryption, SseCustomerAlgorithm};
+use aws_sdk_s3::types::ServerSideEncryption;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_kms::Client as KmsClient;
 
 use crate::proto::proof::v1::*;
 use crate::proto::spec_to_proof::v1::*;
+use crate::ProofConfig;
 
 pub struct S3Storage {
     s3_client: S3Client,
@@ -16,7 +17,7 @@ pub struct S3Storage {
 
 impl S3Storage {
     pub async fn new(config: &ProofConfig) -> Result<Self, Box<dyn Error>> {
-        let aws_config = aws_config::load_default_config(aws_config::BehaviorVersion::latest()).await;
+        let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         
         let s3_client = S3Client::new(&aws_config);
         let kms_client = if config.kms_key_id.is_some() {
@@ -44,7 +45,7 @@ impl S3Storage {
         let encryption_config = self.build_encryption_config(s3_config).await?;
         
         // Upload the theorem code
-        let body = ByteStream::from(theorem.lean_code.as_bytes());
+        let body = ByteStream::from(bytes::Bytes::copy_from_slice(theorem.lean_code.as_bytes()));
         
         let mut upload_request = self.s3_client
             .put_object()
@@ -75,7 +76,7 @@ impl S3Storage {
         upload_request = upload_request.set_metadata(Some(metadata));
 
         // Execute upload
-        let result = upload_request.send().await?;
+        let _result = upload_request.send().await?;
         
         // Generate S3 location URL
         let s3_location = format!(
@@ -105,11 +106,10 @@ impl S3Storage {
             .await?;
 
         // Read the content
-        let body = result.body.collect().await?;
-        let lean_code = String::from_utf8(body.into_bytes())?;
+        let metadata = result.metadata().cloned().unwrap_or_default();
 
-        // Extract metadata
-        let metadata = result.metadata().unwrap_or(&HashMap::new());
+        let body = result.body.collect().await?;
+        let lean_code = String::from_utf8(body.into_bytes().to_vec())?;
         
         // Reconstruct LeanTheorem (simplified - in real implementation, you'd store full proto)
         let theorem = LeanTheorem {
@@ -140,7 +140,6 @@ impl S3Storage {
             .await?;
 
         let keys: Vec<String> = result.contents()
-            .unwrap_or(&[])
             .iter()
             .map(|obj| obj.key().unwrap_or("").to_string())
             .collect();
@@ -172,7 +171,11 @@ impl S3Storage {
         version: &str,
         s3_config: &S3Config,
     ) -> String {
-        let prefix = s3_config.key_prefix.as_deref().unwrap_or("theorems/");
+        let prefix = if s3_config.key_prefix.is_empty() {
+            "theorems/"
+        } else {
+            s3_config.key_prefix.as_str()
+        };
         let invariant_hash = &theorem.content_sha256[..8]; // Use first 8 chars for readability
         
         format!(
@@ -194,12 +197,12 @@ impl S3Storage {
                     Ok(Some(ServerSideEncryption::Aes256))
                 }
                 "aws:kms" => {
-                    if let Some(key_id) = &encryption.kms_key_id {
-                        // Verify KMS key exists and is accessible
+                    if !encryption.kms_key_id.is_empty() {
+                        let key_id = encryption.kms_key_id.clone();
                         if let Some(kms_client) = &self.kms_client {
                             kms_client
                                 .describe_key()
-                                .key_id(key_id)
+                                .key_id(&key_id)
                                 .send()
                                 .await?;
                         }
@@ -289,12 +292,19 @@ impl S3Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_config::BehaviorVersion;
+
+    fn test_sdk_config() -> aws_config::SdkConfig {
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(aws_config::defaults(BehaviorVersion::latest()).load())
+    }
 
     #[test]
     fn test_generate_s3_key() {
         let config = ProofConfig::default();
         let storage = S3Storage {
-            s3_client: S3Client::new(&aws_config::SdkConfig::builder().build()),
+            s3_client: S3Client::new(&test_sdk_config()),
             kms_client: None,
             config,
         };
@@ -314,7 +324,7 @@ mod tests {
 
         let s3_config = S3Config {
             bucket_name: "test-bucket".to_string(),
-            key_prefix: Some("theorems/".to_string()),
+            key_prefix: "theorems/".to_string(),
             region: "us-east-1".to_string(),
             encryption: None,
         };
@@ -327,7 +337,7 @@ mod tests {
     fn test_parse_s3_location() {
         let config = ProofConfig::default();
         let storage = S3Storage {
-            s3_client: S3Client::new(&aws_config::SdkConfig::builder().build()),
+            s3_client: S3Client::new(&test_sdk_config()),
             kms_client: None,
             config,
         };
@@ -343,7 +353,7 @@ mod tests {
     fn test_parse_s3_location_invalid() {
         let config = ProofConfig::default();
         let storage = S3Storage {
-            s3_client: S3Client::new(&aws_config::SdkConfig::builder().build()),
+            s3_client: S3Client::new(&test_sdk_config()),
             kms_client: None,
             config,
         };

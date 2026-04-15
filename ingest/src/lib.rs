@@ -1,11 +1,13 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 use aws_sdk_secretsmanager::Client as SecretsClient;
 use nats::jetstream::Context as JetStreamContext;
+use chrono::{DateTime, Utc};
+use prost::Message;
 use crate::proto::spec_to_proof::v1::SpecDocument;
-use crate::proto::google::protobuf::Timestamp;
+use prost_types::Timestamp;
 
 pub mod proto;
 pub mod connectors;
@@ -27,7 +29,8 @@ pub struct ConnectorConfig {
 pub struct OAuth2Token {
     pub access_token: String,
     pub refresh_token: String,
-    pub expires_at: Instant,
+    /// Unix timestamp (seconds) when the access token expires.
+    pub expires_at_unix: i64,
     pub token_type: String,
 }
 
@@ -90,7 +93,7 @@ impl IngestionConnector {
     async fn publish_document(&self, document: SpecDocument) -> Result<(), Box<dyn std::error::Error>> {
         let subject = format!("spec-documents.{}", self.config.source_system);
         
-        let payload = serde_json::to_vec(&document)?;
+        let payload = document.encode_to_vec();
         
         self.jetstream
             .publish(&subject, &payload)
@@ -110,7 +113,11 @@ impl IngestionConnector {
         let mut cache = self.token_cache.write().await;
         
         if let Some(token) = cache.get(token_key) {
-            if token.expires_at > Instant::now() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if now < token.expires_at_unix {
                 return Ok(token.clone());
             }
         }
@@ -138,8 +145,8 @@ pub struct DocumentMetadata {
     pub title: String,
     pub url: String,
     pub author: String,
-    pub created_at: Timestamp,
-    pub modified_at: Timestamp,
+    pub created_at: DateTime<Utc>,
+    pub modified_at: DateTime<Utc>,
     pub version: i32,
     pub status: String,
     pub metadata: HashMap<String, String>,
@@ -156,8 +163,14 @@ impl From<DocumentMetadata> for SpecDocument {
             content: String::new(), // Will be fetched separately
             url: metadata.url,
             author: metadata.author,
-            created_at: Some(metadata.created_at),
-            modified_at: Some(metadata.modified_at),
+            created_at: Some(Timestamp {
+                seconds: metadata.created_at.timestamp(),
+                nanos: metadata.created_at.timestamp_subsec_nanos() as i32,
+            }),
+            modified_at: Some(Timestamp {
+                seconds: metadata.modified_at.timestamp(),
+                nanos: metadata.modified_at.timestamp_subsec_nanos() as i32,
+            }),
             metadata: metadata.metadata,
             version: metadata.version,
             status: 0, // Will be mapped from string

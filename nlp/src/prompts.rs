@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::error::Error;
 use std::fs;
-use std::path::Path;
 
 pub struct PromptTemplate {
     template: String,
@@ -21,12 +19,12 @@ impl PromptTemplate {
         }
     }
 
-    pub fn render(&self, variables: &HashMap<String, &str>) -> String {
+    pub fn render(&self, variables: &HashMap<String, String>) -> String {
         let mut result = self.template.clone();
 
         for (key, value) in variables {
             let placeholder = format!("{{{{{}}}}}", key);
-            result = result.replace(&placeholder, value);
+            result = result.replace(&placeholder, value.as_str());
         }
 
         result
@@ -98,8 +96,8 @@ mod tests {
         };
 
         let mut variables = HashMap::new();
-        variables.insert("name".to_string(), "Alice");
-        variables.insert("age".to_string(), "30");
+        variables.insert("name".to_string(), "Alice".to_string());
+        variables.insert("age".to_string(), "30".to_string());
 
         let result = template.render(&variables);
         assert_eq!(result, "Hello Alice, you are 30 years old.");
@@ -112,7 +110,7 @@ mod tests {
         };
 
         let mut variables = HashMap::new();
-        variables.insert("name".to_string(), "Alice");
+        variables.insert("name".to_string(), "Alice".to_string());
 
         let result = template.render(&variables);
         assert_eq!(result, "Hello Alice, you are {{age}} years old.");

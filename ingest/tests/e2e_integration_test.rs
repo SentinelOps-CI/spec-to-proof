@@ -154,7 +154,10 @@ async fn test_jira_connector_e2e() {
     let token = OAuth2Token {
         access_token: "test_access_token".to_string(),
         refresh_token: "test_refresh_token".to_string(),
-        expires_at: std::time::Instant::now() + Duration::from_secs(3600),
+        expires_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64 + 3600)
+            .unwrap_or(0),
         token_type: "Bearer".to_string(),
     };
 
@@ -262,7 +265,10 @@ async fn test_confluence_connector_e2e() {
     let token = OAuth2Token {
         access_token: "test_access_token".to_string(),
         refresh_token: "test_refresh_token".to_string(),
-        expires_at: std::time::Instant::now() + Duration::from_secs(3600),
+        expires_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64 + 3600)
+            .unwrap_or(0),
         token_type: "Bearer".to_string(),
     };
 
@@ -395,7 +401,10 @@ async fn test_gdocs_connector_e2e() {
     let token = OAuth2Token {
         access_token: "test_access_token".to_string(),
         refresh_token: "test_refresh_token".to_string(),
-        expires_at: std::time::Instant::now() + Duration::from_secs(3600),
+        expires_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64 + 3600)
+            .unwrap_or(0),
         token_type: "Bearer".to_string(),
     };
 

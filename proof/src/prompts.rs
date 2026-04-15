@@ -55,7 +55,11 @@ The invariant specification will include:
 
 Generate a complete Lean 4 theorem that captures the mathematical essence of the invariant.
 
-Use the generate_lean_theorem function to provide your response."#.to_string()
+Use the generate_lean_theorem function to provide your response.
+
+---
+Invariant (natural language): {{invariant}}
+Proof strategy: {{strategy}}"#.to_string()
     }
 
     fn get_proof_completion_prompt() -> String {
@@ -218,7 +222,7 @@ impl GuardedPrompt {
     }
 
     pub fn render(&self, variables: &HashMap<String, &str>) -> Result<String, Box<dyn std::error::Error>> {
-        let mut result = self.template.render(variables);
+        let result = self.template.render(variables);
         
         // Check for injection patterns
         for pattern in &self.injection_patterns {

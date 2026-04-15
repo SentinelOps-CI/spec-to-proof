@@ -98,4 +98,4 @@ Return a JSON array of invariants with the following structure:
 
 ## Response
 
-Provide only the JSON response with no additional text or explanation. 
+Provide only the JSON response with no additional text or explanation. Do not wrap the JSON in Markdown code fences.

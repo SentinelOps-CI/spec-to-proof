@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::error::Error;
+
+use anyhow::Result;
 use regex::Regex;
-use crate::proto::nlp::v1::{ExtractedInvariant, Variable};
+use crate::proto::nlp::v1::ExtractedInvariant;
 
 pub struct PostProcessor {
     variable_name_patterns: Vec<(Regex, String)>,
@@ -10,41 +11,41 @@ pub struct PostProcessor {
 
 impl PostProcessor {
     pub fn new() -> Self {
-        let mut variable_name_patterns = Vec::new();
-        
         // Common variable name normalizations
-        variable_name_patterns.push((
-            Regex::new(r"(?i)user\s*id").unwrap(),
-            "user_id".to_string()
-        ));
-        variable_name_patterns.push((
-            Regex::new(r"(?i)system\s*status").unwrap(),
-            "system_status".to_string()
-        ));
-        variable_name_patterns.push((
-            Regex::new(r"(?i)request\s*count").unwrap(),
-            "request_count".to_string()
-        ));
-        variable_name_patterns.push((
-            Regex::new(r"(?i)response\s*time").unwrap(),
-            "response_time".to_string()
-        ));
-        variable_name_patterns.push((
-            Regex::new(r"(?i)error\s*rate").unwrap(),
-            "error_rate".to_string()
-        ));
-        variable_name_patterns.push((
-            Regex::new(r"(?i)memory\s*usage").unwrap(),
-            "memory_usage".to_string()
-        ));
-        variable_name_patterns.push((
-            Regex::new(r"(?i)cpu\s*usage").unwrap(),
-            "cpu_usage".to_string()
-        ));
-        variable_name_patterns.push((
-            Regex::new(r"(?i)connection\s*count").unwrap(),
-            "connection_count".to_string()
-        ));
+        let variable_name_patterns = vec![
+            (
+                Regex::new(r"(?i)user\s*id").unwrap(),
+                "user_id".to_string(),
+            ),
+            (
+                Regex::new(r"(?i)system\s*status").unwrap(),
+                "system_status".to_string(),
+            ),
+            (
+                Regex::new(r"(?i)request\s*count").unwrap(),
+                "request_count".to_string(),
+            ),
+            (
+                Regex::new(r"(?i)response\s*time").unwrap(),
+                "response_time".to_string(),
+            ),
+            (
+                Regex::new(r"(?i)error\s*rate").unwrap(),
+                "error_rate".to_string(),
+            ),
+            (
+                Regex::new(r"(?i)memory\s*usage").unwrap(),
+                "memory_usage".to_string(),
+            ),
+            (
+                Regex::new(r"(?i)cpu\s*usage").unwrap(),
+                "cpu_usage".to_string(),
+            ),
+            (
+                Regex::new(r"(?i)connection\s*count").unwrap(),
+                "connection_count".to_string(),
+            ),
+        ];
 
         let mut unit_standardization = HashMap::new();
         
@@ -56,14 +57,17 @@ impl PostProcessor {
         unit_standardization.insert("min".to_string(), "minutes".to_string());
         unit_standardization.insert("minutes".to_string(), "minutes".to_string());
         
-        // Size units
+        // Size units (keys are lowercased in standardize_unit)
         unit_standardization.insert("B".to_string(), "bytes".to_string());
         unit_standardization.insert("bytes".to_string(), "bytes".to_string());
         unit_standardization.insert("KB".to_string(), "kilobytes".to_string());
+        unit_standardization.insert("kb".to_string(), "kilobytes".to_string());
         unit_standardization.insert("kilobytes".to_string(), "kilobytes".to_string());
         unit_standardization.insert("MB".to_string(), "megabytes".to_string());
+        unit_standardization.insert("mb".to_string(), "megabytes".to_string());
         unit_standardization.insert("megabytes".to_string(), "megabytes".to_string());
         unit_standardization.insert("GB".to_string(), "gigabytes".to_string());
+        unit_standardization.insert("gb".to_string(), "gigabytes".to_string());
         unit_standardization.insert("gigabytes".to_string(), "gigabytes".to_string());
         
         // Count units
@@ -86,7 +90,7 @@ impl PostProcessor {
     pub async fn process_invariants(
         &self,
         invariants: Vec<ExtractedInvariant>,
-    ) -> Result<Vec<ExtractedInvariant>, Box<dyn Error>> {
+    ) -> Result<Vec<ExtractedInvariant>> {
         let mut processed_invariants = Vec::new();
 
         for mut invariant in invariants {
@@ -95,11 +99,11 @@ impl PostProcessor {
                 variable.name = self.normalize_variable_name(&variable.name);
             }
 
-            // Standardize units
+            // Standardize units; keys follow the same normalization as variable names
             let mut normalized_units = HashMap::new();
             for (var_name, unit) in &invariant.units {
-                let normalized_unit = self.standardize_unit(unit);
-                normalized_units.insert(var_name.clone(), normalized_unit);
+                let key = self.normalize_variable_name(var_name);
+                normalized_units.insert(key, self.standardize_unit(unit));
             }
             invariant.units = normalized_units;
 
@@ -179,6 +183,12 @@ impl PostProcessor {
     }
 }
 
+impl Default for PostProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,7 +242,7 @@ mod tests {
             variables: vec![
                 Variable {
                     name: "User ID".to_string(),
-                    type_: "integer".to_string(),
+                    r#type: "integer".to_string(),
                     description: "User identifier".to_string(),
                     unit: "count".to_string(),
                     constraints: vec![],
@@ -245,7 +255,7 @@ mod tests {
             },
             confidence_score: 0.9,
             tags: vec!["test".to_string()],
-            priority: Priority::PriorityHigh as i32,
+            priority: Priority::High as i32,
             extraction_metadata: None,
         };
 

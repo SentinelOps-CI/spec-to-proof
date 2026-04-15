@@ -1,0 +1,153 @@
+syntax = "proto3";
+
+package nlp.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/fraware/spec-to-proof/nlp/proto";
+option java_multiple_files = true;
+option java_package = "com.fraware.nlp.v1";
+
+// Request to extract invariants from a specification document
+message ExtractInvariantsRequest {
+  // The specification document to analyze
+  string document_id = 1;
+  
+  // Document content (will be redacted for PII before processing)
+  string content = 2;
+  
+  // Document title for context
+  string title = 3;
+  
+  // Source system identifier
+  string source_system = 4;
+  
+  // Optional: specific invariant types to focus on
+  repeated string invariant_types = 5;
+  
+  // Optional: confidence threshold (0.0 to 1.0)
+  double confidence_threshold = 6;
+}
+
+// Response containing extracted invariants
+message ExtractInvariantsResponse {
+  // List of extracted invariants
+  repeated ExtractedInvariant invariants = 1;
+  
+  // Total token usage for this extraction
+  TokenUsage token_usage = 2;
+  
+  // Processing metadata
+  ProcessingMetadata metadata = 3;
+}
+
+// An extracted invariant candidate
+message ExtractedInvariant {
+  // Human-readable description
+  string description = 1;
+  
+  // Formal mathematical expression
+  string formal_expression = 2;
+  
+  // Natural language description
+  string natural_language = 3;
+  
+  // Variables used in the invariant
+  repeated Variable variables = 4;
+  
+  // Units for variables
+  map<string, string> units = 5;
+  
+  // Confidence score (0.0 to 1.0)
+  double confidence_score = 6;
+  
+  // Tags for categorization
+  repeated string tags = 7;
+  
+  // Priority level
+  Priority priority = 8;
+  
+  // Extraction metadata
+  ExtractionMetadata extraction_metadata = 9;
+}
+
+// Variable definition
+message Variable {
+  string name = 1;
+  string type = 2;
+  string description = 3;
+  string unit = 4;
+  repeated string constraints = 5;
+}
+
+// Priority levels
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_LOW = 1;
+  PRIORITY_MEDIUM = 2;
+  PRIORITY_HIGH = 3;
+  PRIORITY_CRITICAL = 4;
+}
+
+// Token usage information
+message TokenUsage {
+  int32 input_tokens = 1;
+  int32 output_tokens = 2;
+  int32 total_tokens = 3;
+  double estimated_cost_usd = 4;
+}
+
+// Processing metadata
+message ProcessingMetadata {
+  // When the extraction was performed
+  google.protobuf.Timestamp processed_at = 1;
+  
+  // Model used for extraction
+  string model_used = 2;
+  
+  // Processing duration in milliseconds
+  int64 duration_ms = 3;
+  
+  // Whether this was served from cache
+  bool cached = 4;
+  
+  // Cache key used
+  string cache_key = 5;
+}
+
+// Extraction-specific metadata
+message ExtractionMetadata {
+  // Prompt template version used
+  string prompt_version = 1;
+  
+  // Post-processing rules applied
+  repeated string post_processing_rules = 2;
+  
+  // Number of retries attempted
+  int32 retry_count = 3;
+  
+  // Whether PII was detected and redacted
+  bool pii_detected = 4;
+  
+  // Redacted fields (if any)
+  repeated string redacted_fields = 5;
+}
+
+// Service for NLP-based invariant extraction
+service NlpService {
+  // Extract invariants from a specification document
+  rpc ExtractInvariants(ExtractInvariantsRequest) returns (ExtractInvariantsResponse);
+  
+  // Health check endpoint
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// Health check request
+message HealthCheckRequest {}
+
+// Health check response
+message HealthCheckResponse {
+  string status = 1;
+  string version = 2;
+  google.protobuf.Timestamp timestamp = 3;
+} 

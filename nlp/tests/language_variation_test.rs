@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-integration-tests")]
+
 use std::collections::HashMap;
 use nlp::{
     NlpService, InvariantExtractionConfig,

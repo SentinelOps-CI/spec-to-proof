@@ -1,5 +1,6 @@
-use std::error::Error;
 use std::time::Duration;
+
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use reqwest::Client;
 use tokio::time::sleep;
@@ -25,6 +26,7 @@ struct ClaudeResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Populated by API; not all fields read in current client.
 struct ClaudeContent {
     #[serde(rename = "type")]
     content_type: String,
@@ -63,9 +65,9 @@ impl ClaudeClient {
         prompt: &str,
         max_retries: u32,
         retry_delay_ms: u64,
-    ) -> Result<(String, u32, u32), Box<dyn Error>> {
-        let mut last_error = None;
-        
+    ) -> Result<(String, u32, u32)> {
+        let mut last_error: Option<String> = None;
+
         for attempt in 0..=max_retries {
             match self.make_request(prompt).await {
                 Ok((response_text, input_tokens, output_tokens)) => {
@@ -77,14 +79,15 @@ impl ClaudeClient {
                     return Ok((response_text, input_tokens, output_tokens));
                 }
                 Err(e) => {
-                    last_error = Some(e);
+                    let msg = e.to_string();
+                    last_error = Some(msg.clone());
                     if attempt < max_retries {
                         tracing::warn!(
                             "Claude API call failed (attempt {}/{}), retrying in {}ms: {}",
                             attempt + 1,
                             max_retries + 1,
                             retry_delay_ms,
-                            last_error.as_ref().unwrap()
+                            msg
                         );
                         sleep(Duration::from_millis(retry_delay_ms)).await;
                     }
@@ -92,10 +95,10 @@ impl ClaudeClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| "Unknown error".into()))
+        Err(anyhow!(last_error.unwrap_or_else(|| "Unknown error".to_string())))
     }
 
-    async fn make_request(&self, prompt: &str) -> Result<(String, u32, u32), Box<dyn Error>> {
+    async fn make_request(&self, prompt: &str) -> Result<(String, u32, u32)> {
         let request = ClaudeRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
@@ -117,15 +120,16 @@ impl ClaudeClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if !status.is_success() {
             let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(format!("Claude API error: {} - {}", response.status(), error_text).into());
+            return Err(anyhow!("Claude API error: {} - {}", status, error_text));
         }
 
         let claude_response: ClaudeResponse = response.json().await?;
         
         if claude_response.content.is_empty() {
-            return Err("Empty response from Claude API".into());
+            return Err(anyhow!("Empty response from Claude API"));
         }
 
         let response_text = claude_response.content[0].text.clone();

@@ -1,6 +1,6 @@
-use std::error::Error;
+use anyhow::{Context, Result};
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{info, warn, error};
+use tracing::{info, error};
 use aws_config::BehaviorVersion;
 
 use nlp::{
@@ -62,7 +62,7 @@ impl NlpServiceTrait for NlpServiceImpl {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let nlp_service = NlpService::new(config, dynamo_client).await?;
 
     // Ensure cache table exists
-    nlp_service.cache.ensure_table_exists().await?;
+    nlp_service.ensure_cache_table_exists().await?;
 
     // Create service implementation
     let service_impl = NlpServiceImpl {
@@ -104,9 +104,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn load_config() -> Result<InvariantExtractionConfig, Box<dyn Error>> {
+fn load_config() -> Result<InvariantExtractionConfig> {
     let claude_api_key = std::env::var("CLAUDE_API_KEY")
-        .map_err(|_| "CLAUDE_API_KEY environment variable is required")?;
+        .context("CLAUDE_API_KEY environment variable is required")?;
 
     let config = InvariantExtractionConfig {
         claude_api_key,

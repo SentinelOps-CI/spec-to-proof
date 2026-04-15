@@ -1,7 +1,3 @@
-# Bazel
-bazel-*
-.bazel/
-
 # Node.js
 node_modules/
 npm-debug.log*
@@ -17,11 +13,10 @@ build/
 
 # Rust
 target/
-Cargo.lock
 *.rs.bk
 
-# Lean
-lake-manifest.json
+# Lean / Lake
+.lake/
 lake-packages/
 
 # IDE
@@ -63,7 +58,7 @@ build/
 .terraform.lock.hcl
 
 # Docker
-.dockerignore
+docker-compose.override.yml
 
 # Temporary files
 *.tmp

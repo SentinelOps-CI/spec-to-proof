@@ -1,3 +1,6 @@
+# Development-only defaults. Do not use these passwords in production.
+# Copy `.env.example` to `.env` and override secrets for local runs.
+
 version: '3.8'
 
 services:
