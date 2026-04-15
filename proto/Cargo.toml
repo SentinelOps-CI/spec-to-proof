@@ -22,5 +22,5 @@ tonic-build = "0.10"
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 proptest = "1.3"
