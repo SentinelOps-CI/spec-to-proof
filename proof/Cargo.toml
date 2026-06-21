@@ -17,7 +17,7 @@ tonic = "0.10"
 prost-types = "0.12"
 reqwest = { version = "0.11", features = ["json"] }
 aws-config = "~1.5"
-aws-sdk-s3 = "~1.40"
+aws-sdk-s3 = "~1.129"
 aws-sdk-kms = "~1.40"
 sha2 = "0.10"
 tracing = "0.1"
