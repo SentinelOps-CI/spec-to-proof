@@ -14,7 +14,6 @@ WORKDIR /app
 
 # Copy Cargo files
 COPY Cargo.toml Cargo.lock ./
-COPY build.rs ./
 
 # Create dummy main.rs to build dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
@@ -80,11 +79,11 @@ USER leanfarm
 # Set working directory
 WORKDIR /var/lean-farm
 
-# Set environment variables
+# Set environment variables. The Lean toolchain itself lives in the separate
+# sandbox runner image (see lean-runner.Dockerfile); this service image only
+# needs a Docker client to launch those hardened sandboxes.
 ENV LEAN_FARM_SECURE=true \
     LEAN_FARM_ISOLATED=true \
-    LEAN_VERSION=4.7.0 \
-    LAKE_BUILD_TIMEOUT=300 \
     RUST_LOG=info
 
 # Entry point
