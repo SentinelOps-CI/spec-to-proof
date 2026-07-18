@@ -109,7 +109,7 @@ flowchart LR
 
 | Layer | Choices |
 | --- | --- |
-| **Rust** | Root workspace: `proto`, `nlp`, `proof` (`Cargo.toml`). The `ingest/` crate ships alongside but is not a workspace member yet—build it from that directory if you work on connectors. |
+| **Rust** | Root workspace: `proto`, `nlp`, `proof`, `platform/gh-app` (`Cargo.toml`). The `ingest/` and `lean-farm/` crates ship alongside but are intentionally excluded from the root workspace (standalone binaries with their own MSRV-pinned `Cargo.lock`); build each from its own directory. See [docs/adr/0001](docs/adr/0001-cargo-workspace-and-optional-bazel.md). |
 | **Frontend** | TypeScript, Next.js 14, tRPC—invoked from repo root via `package.json` scripts. |
 | **Formal methods** | Lean 4 + Lake under `proof/lean/`. |
 | **Contracts** | Protocol Buffers and gRPC (`proto/`). |
@@ -141,6 +141,31 @@ cargo run -p proof --bin lean_compiler
 
 More detail: [CONTRIBUTING.md](CONTRIBUTING.md).
 
+### End-to-end proving (local, no AWS)
+
+`lean-farm` checks proofs for real: it generates a self-contained Lean source,
+runs it with the Lean toolchain inside a hardened container (read-only,
+non-root, no network, resource-capped; Docker or gVisor), and records the
+artifact status from the actual result. Proof artifacts persist to any
+S3-compatible store (MinIO locally) and a `ProofArtifactReference` is emitted for
+the GitHub App badge.
+
+```bash
+# 1. Build the pinned Lean sandbox image (once).
+docker build -f lean-farm/lean-runner.Dockerfile \
+  --build-arg LEAN_TOOLCHAIN=leanprover/lean4:v4.22.0 \
+  -t spec-to-proof/lean-runner:v4.22.0 lean-farm
+
+# 2. Optional: local artifact store.
+docker compose -f docker-compose.e2e.yml up -d
+
+# 3. Run the real proving path (Docker-gated so CI stays green without Docker).
+cd lean-farm
+E2E_DOCKER=1 cargo test --test e2e_proving_test -- --nocapture
+```
+
+See [lean-farm/README.md](lean-farm/README.md) for the full workflow.
+
 ---
 
 ## Repository layout
@@ -151,8 +176,9 @@ spec-to-proof/
 ├── nlp/             # NLP pipeline and prompts
 ├── proof/           # Proof service, Lean project under proof/lean/
 ├── platform/ui/     # Next.js frontend
-├── ingest/          # Connectors (standalone crate; not in root workspace)
-├── lean-farm/       # Lean job runner image and tooling
+├── ingest/          # Connectors (standalone crate; excluded from root workspace)
+├── lean-farm/       # Lean job runner (standalone crate; excluded from root workspace)
+├── platform/gh-app/ # GitHub App / webhook service (root workspace member)
 ├── terraform/       # Infrastructure as code
 ├── charts/          # Helm charts
 ├── docs/adr/        # Architecture decision records

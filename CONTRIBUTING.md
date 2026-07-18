@@ -43,6 +43,40 @@ cd proof/lean
 lake build
 ```
 
+## End-to-end Lean proving (`lean-farm`)
+
+`lean-farm` runs Lean proofs for real inside a hardened container. It is a
+standalone crate (excluded from the root workspace), so run its commands from
+its own directory.
+
+```bash
+cd lean-farm
+
+# Hermetic suite (no Docker/object store required):
+cargo test
+
+# Build the pinned Lean sandbox image once (from the repository root):
+cd .. && docker build -f lean-farm/lean-runner.Dockerfile \
+  --build-arg LEAN_TOOLCHAIN=leanprover/lean4:v4.22.0 \
+  -t spec-to-proof/lean-runner:v4.22.0 lean-farm && cd lean-farm
+
+# Real Docker-backed proving (gated by E2E_DOCKER so CI stays green without Docker):
+#   POSIX:      E2E_DOCKER=1 cargo test --test e2e_proving_test -- --nocapture
+#   PowerShell: $env:E2E_DOCKER = "1"; cargo test --test e2e_proving_test -- --nocapture
+```
+
+Local, AWS-free artifact storage uses MinIO from the repository root:
+
+```bash
+docker compose -f docker-compose.e2e.yml up -d
+# then, in lean-farm/ with AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1
+E2E_MINIO=1 cargo test --test minio_storage_test -- --nocapture
+docker compose -f docker-compose.e2e.yml down -v
+```
+
+See [`lean-farm/README.md`](lean-farm/README.md) for the full E2E workflow and
+how to wire proof outcomes into the GitHub App badge (`PROOF_REFERENCE_DIR`).
+
 ## Optional NLP integration tests
 
 Rust integration tests under `nlp/tests/` are gated behind `--features legacy-integration-tests` until they are refreshed for the current AWS SDK and fixtures:
