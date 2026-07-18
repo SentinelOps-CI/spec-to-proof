@@ -62,3 +62,20 @@ lake build
 - Retry backoff is exponential with saturation guards.
 - Prompt sanitization and input validation are part of the crate tests.
 - For repository-wide quality gates, use root-level `./scripts/ci-lint.sh` (or `./scripts/ci-lint.ps1` on Windows).
+
+## Metrics and confidence scoring
+
+- Compilation and proof responses report **real token usage and estimated cost**,
+  aggregated from the per-theorem counters returned by the model client and
+  priced via `COST_PER_1K_TOKENS`. The proof-generation path also reports the
+  **actual number of attempts** taken by the retry loop.
+- Each proof artifact carries a **confidence score in `[0, 1]`**. This is a
+  conservative heuristic (capped at `0.95`) intended purely for prioritisation:
+  proofs that defer their goal with `sorry`/`admit` score `0.1`, and the score
+  otherwise scales with estimated difficulty and tactic richness. It is **not** a
+  substitute for machine-checking the proof with Lean, which the lean-farm runner
+  performs.
+- `ResourceUsage` on a proof artifact records the payload bytes exchanged with
+  the model (`network_bytes`), the on-disk size of the generated artifact
+  (`disk_bytes`), and the CPU time of local post-processing (`cpu_seconds`);
+  heavy Lean-checking resource accounting is owned by the lean-farm runner.

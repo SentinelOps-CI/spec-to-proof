@@ -88,24 +88,34 @@ fn load_config() -> Result<ProofConfig, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // `load_config` reads process-global environment variables. Tests run in
+    // parallel threads within a single process, so they must not race on that
+    // shared state. Serialize every env-mutating test through this lock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_config_loading() {
-        // Set required environment variable
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         std::env::set_var("CLAUDE_API_KEY", "test-key");
-        
+
         let config = load_config().unwrap();
         assert_eq!(config.claude_api_key, "test-key");
         assert_eq!(config.claude_model, "claude-3-opus-20240229");
         assert_eq!(config.temperature, 0.0);
         assert_eq!(config.max_tokens, 8000);
+
+        std::env::remove_var("CLAUDE_API_KEY");
     }
 
     #[test]
     fn test_config_loading_missing_api_key() {
-        // Remove the API key
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         std::env::remove_var("CLAUDE_API_KEY");
-        
+
         let result = load_config();
         match result {
             Err(e) => assert!(e.to_string().contains("CLAUDE_API_KEY")),

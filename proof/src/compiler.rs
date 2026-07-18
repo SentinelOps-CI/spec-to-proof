@@ -96,8 +96,19 @@ impl LeanCompiler {
             .generate_proof(&theorem.lean_code, &strategy, options.seed)
             .await?;
 
+        // Local (CPU-bound) post-processing begins here. We time it separately
+        // from the network round-trip above so `cpu_seconds` reflects the work
+        // actually performed by this service rather than time spent awaiting the
+        // Claude API.
+        let local_start = Instant::now();
+
         // Parse the proof response
         let parsed_proof = self.parse_proof_response(&proof_code)?;
+        let difficulty = parsed_proof
+            .get("difficulty")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
         
         // Combine original theorem with proof
         let complete_lean_code = format!("{}\n\n{}", theorem.lean_code, proof_code);
@@ -105,7 +116,7 @@ impl LeanCompiler {
         
         // Create proven theorem
         let mut proven_theorem = theorem.clone();
-        proven_theorem.lean_code = complete_lean_code;
+        proven_theorem.lean_code = complete_lean_code.clone();
         proven_theorem.content_sha256 = new_content_hash;
         proven_theorem.status = TheoremStatus::Proven as i32;
         
@@ -115,17 +126,30 @@ impl LeanCompiler {
         metadata.insert("proof_output_tokens".to_string(), output_tokens.to_string());
         metadata.insert("proof_generation_time_ms".to_string(), start_time.elapsed().as_millis().to_string());
         metadata.insert("proof_strategy".to_string(), strategy.clone());
+        // Single compiler invocation; the retry/attempt counter is owned by the
+        // service layer (`ProofServiceImpl::generate_proof`) and overwritten
+        // there with the real attempt count.
         metadata.insert("attempts".to_string(), "1".to_string());
         
         if let Some(tactics) = parsed_proof.get("tactics_used") {
             metadata.insert("tactics_used".to_string(), serde_json::to_string(tactics)?);
         }
         
-        if let Some(difficulty) = parsed_proof.get("difficulty") {
-            metadata.insert("difficulty".to_string(), difficulty.as_str().unwrap_or("unknown").to_string());
-        }
+        metadata.insert("difficulty".to_string(), difficulty.clone());
+        
+        let confidence_score = self.compute_confidence_score(&proof_code, &difficulty);
+        metadata.insert("confidence_score".to_string(), format!("{:.4}", confidence_score));
         
         proven_theorem.metadata = metadata;
+
+        // Real resource accounting for this proof-generation step. This service
+        // is network-bound (it delegates heavy Lean checking to lean-farm), so
+        // we record the payload volume moved over the wire and the on-disk size
+        // of the artifact produced, plus the CPU time of local processing.
+        let cpu_seconds = local_start.elapsed().as_secs_f64();
+        let network_bytes = (theorem.lean_code.len() + proof_code.len()) as i64;
+        let disk_bytes = complete_lean_code.len() as i64;
+        let memory_bytes = complete_lean_code.capacity() as i64;
 
         // Create proof artifact
         let proof_artifact = ProofArtifact {
@@ -139,13 +163,13 @@ impl LeanCompiler {
             output: proof_code,
             logs: vec!["Proof generated successfully".to_string()],
             resource_usage: Some(ResourceUsage {
-                cpu_seconds: 0.0, // TODO: Track actual CPU usage
-                memory_bytes: 0,   // TODO: Track actual memory usage
-                disk_bytes: 0,     // TODO: Track actual disk usage
-                network_bytes: 0,  // TODO: Track actual network usage
+                cpu_seconds,
+                memory_bytes,
+                disk_bytes,
+                network_bytes,
             }),
             proof_strategy: strategy,
-            confidence_score: 1.0, // TODO: Implement confidence scoring
+            confidence_score,
             metadata: HashMap::new(),
         };
 
@@ -291,6 +315,43 @@ impl LeanCompiler {
         }
         
         tactics
+    }
+
+    /// Heuristic confidence that the generated proof is correct, in `[0, 1]`.
+    ///
+    /// A model-generated proof cannot be trusted until the Lean toolchain
+    /// checks it, so this score is intentionally conservative and capped below
+    /// `1.0`. It is a prioritisation signal only and is **not** a substitute for
+    /// `lean` compilation, which is performed by the lean-farm runner. The
+    /// heuristic hard-fails proofs that defer their goals with `sorry`/`admit`
+    /// (these never constitute a real proof), then scales a difficulty-based
+    /// base confidence by the structural richness of the tactic block.
+    fn compute_confidence_score(&self, proof_code: &str, difficulty: &str) -> f64 {
+        let trimmed = proof_code.trim();
+        if trimmed.is_empty() {
+            return 0.0;
+        }
+
+        // `sorry` / `admit` explicitly leave a goal unproven, so any proof that
+        // relies on them is not a proof at all.
+        let lowered = proof_code.to_lowercase();
+        if lowered.contains("sorry") || lowered.contains("admit") {
+            return 0.1;
+        }
+
+        let base = match difficulty {
+            "easy" => 0.90,
+            "medium" => 0.78,
+            "hard" => 0.60,
+            _ => 0.70,
+        };
+
+        // Reward proofs that actually invoke tactics; a single-tactic proof is
+        // weaker evidence than a structured multi-tactic derivation.
+        let tactic_count = self.extract_tactics(proof_code).len();
+        let richness_bonus = (tactic_count as f64 * 0.01).min(0.08);
+
+        (base + richness_bonus).min(0.95)
     }
 
     fn estimate_difficulty(&self, proof_code: &str) -> String {
@@ -447,6 +508,43 @@ constructor
 split
 "#;
         assert_eq!(compiler.estimate_difficulty(hard_proof), "hard");
+    }
+
+    #[test]
+    fn test_confidence_score_rejects_sorry() {
+        let config = ProofConfig::default();
+        let compiler = LeanCompiler::new(&config);
+
+        // A proof deferring the goal with `sorry`/`admit` is not a real proof.
+        assert_eq!(compiler.compute_confidence_score("by\n  sorry", "easy"), 0.1);
+        assert_eq!(compiler.compute_confidence_score("by\n  admit", "hard"), 0.1);
+        // Empty proofs carry no confidence at all.
+        assert_eq!(compiler.compute_confidence_score("   ", "easy"), 0.0);
+    }
+
+    #[test]
+    fn test_confidence_score_scales_with_difficulty_and_richness() {
+        let config = ProofConfig::default();
+        let compiler = LeanCompiler::new(&config);
+
+        let easy = compiler.compute_confidence_score("by\n  simp", "easy");
+        let hard = compiler.compute_confidence_score("by\n  simp", "hard");
+        let unknown = compiler.compute_confidence_score("by\n  simp", "unknown");
+
+        // Harder proofs are trusted less than easy ones for identical structure.
+        assert!(easy > hard);
+        assert!(easy > unknown && unknown > hard);
+        // Never claim certainty before Lean actually checks the proof.
+        assert!(easy <= 0.95);
+
+        // Richer tactic blocks earn a bounded bonus over a single tactic.
+        let single = compiler.compute_confidence_score("by\n  simp", "medium");
+        let rich = compiler.compute_confidence_score(
+            "by\n  intro x\n  cases x\n  simp\n  apply foo\n  exact rfl",
+            "medium",
+        );
+        assert!(rich > single);
+        assert!(rich <= 0.95);
     }
 
     #[test]

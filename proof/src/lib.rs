@@ -130,12 +130,21 @@ impl ProofServiceImpl {
                 .await
                 .map_err(|e| e.to_string())
             {
-                Ok((proven_theorem, proof_artifact)) => {
+                Ok((mut proven_theorem, mut proof_artifact)) => {
                     let duration_ms = start_time.elapsed().as_millis() as u64;
                     
                     tracing::info!("Proof generated successfully in {}ms after {} attempts", 
                         duration_ms, attempts);
-                    
+
+                    // Record the real number of attempts taken by the retry loop
+                    // (the compiler only sees a single invocation). Both the
+                    // theorem metadata and the artifact duration are updated so
+                    // downstream consumers observe the end-to-end cost.
+                    proven_theorem
+                        .metadata
+                        .insert("attempts".to_string(), attempts.to_string());
+                    proof_artifact.duration_ms = duration_ms as i64;
+
                     return Ok((proven_theorem, proof_artifact));
                 }
                 Err(err_msg) => {
@@ -209,8 +218,33 @@ impl ProofServiceImpl {
     }
 
     fn estimate_cost(&self, input_tokens: u32, output_tokens: u32) -> f64 {
-        let total_tokens = input_tokens + output_tokens;
+        let total_tokens = input_tokens.saturating_add(output_tokens);
         (total_tokens as f64 / 1000.0) * self.config.cost_per_1k_tokens
+    }
+
+    /// Aggregate the per-theorem token counters that the compiler records in
+    /// `LeanTheorem::metadata` into `(input_tokens, output_tokens)`.
+    ///
+    /// `key_prefix` is `""` for the compilation path (keys `input_tokens` /
+    /// `output_tokens`) and `"proof_"` for the proof-generation path (keys
+    /// `proof_input_tokens` / `proof_output_tokens`).
+    fn aggregate_tokens<'a, I>(theorems: I, key_prefix: &str) -> (u32, u32)
+    where
+        I: IntoIterator<Item = &'a LeanTheorem>,
+    {
+        let input_key = format!("{}input_tokens", key_prefix);
+        let output_key = format!("{}output_tokens", key_prefix);
+        let mut input = 0u32;
+        let mut output = 0u32;
+        for theorem in theorems {
+            if let Some(value) = theorem.metadata.get(&input_key) {
+                input = input.saturating_add(value.parse().unwrap_or(0));
+            }
+            if let Some(value) = theorem.metadata.get(&output_key) {
+                output = output.saturating_add(value.parse().unwrap_or(0));
+            }
+        }
+        (input, output)
     }
 
     fn get_uptime_seconds(&self) -> u64 {
@@ -233,11 +267,18 @@ impl ProofServiceTrait for ProofServiceImpl {
         match self.compile_invariant_set(&req.invariant_set.unwrap(), &req.options.unwrap()).await {
             Ok(theorems) => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
-                
+
+                let (input_tokens, output_tokens) = Self::aggregate_tokens(&theorems, "");
+                let estimated_cost = self.estimate_cost(input_tokens, output_tokens);
+
                 let metadata = CompilationMetadata {
                     duration_ms,
-                    token_usage: None, // TODO: Aggregate token usage
-                    estimated_cost: 0.0, // TODO: Calculate actual cost
+                    token_usage: Some(TokenUsage {
+                        input_tokens,
+                        output_tokens,
+                        total_tokens: input_tokens.saturating_add(output_tokens),
+                    }),
+                    estimated_cost,
                     compiled_at: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
                 };
 
@@ -266,12 +307,27 @@ impl ProofServiceTrait for ProofServiceImpl {
         match self.generate_proof(&req.theorem.unwrap(), &req.options.unwrap()).await {
             Ok((theorem, proof_artifact)) => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
-                
+
+                let (input_tokens, output_tokens) = Self::aggregate_tokens(
+                    std::iter::once(&theorem),
+                    "proof_",
+                );
+                let estimated_cost = self.estimate_cost(input_tokens, output_tokens);
+                let attempts = theorem
+                    .metadata
+                    .get("attempts")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1);
+
                 let metadata = ProofMetadata {
                     duration_ms,
-                    token_usage: None, // TODO: Get actual token usage
-                    estimated_cost: 0.0, // TODO: Calculate actual cost
-                    attempts: 1, // TODO: Track actual attempts
+                    token_usage: Some(TokenUsage {
+                        input_tokens,
+                        output_tokens,
+                        total_tokens: input_tokens.saturating_add(output_tokens),
+                    }),
+                    estimated_cost,
+                    attempts,
                     generated_at: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
                 };
 
@@ -321,4 +377,54 @@ impl ProofServiceTrait for ProofServiceImpl {
 
         Ok(Response::new(response))
     }
-} 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn theorem_with_tokens(pairs: &[(&str, &str)]) -> LeanTheorem {
+        let mut metadata = HashMap::new();
+        for (key, value) in pairs {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        LeanTheorem {
+            id: "t".to_string(),
+            content_sha256: String::new(),
+            theorem_name: "t".to_string(),
+            lean_code: String::new(),
+            source_invariant_id: String::new(),
+            generated_at: None,
+            status: 0,
+            compilation_errors: Vec::new(),
+            proof_strategy: String::new(),
+            metadata,
+        }
+    }
+
+    #[test]
+    fn aggregate_tokens_sums_compilation_counters() {
+        let theorems = vec![
+            theorem_with_tokens(&[("input_tokens", "100"), ("output_tokens", "40")]),
+            theorem_with_tokens(&[("input_tokens", "25"), ("output_tokens", "5")]),
+        ];
+
+        let (input, output) = ProofServiceImpl::aggregate_tokens(&theorems, "");
+        assert_eq!(input, 125);
+        assert_eq!(output, 45);
+    }
+
+    #[test]
+    fn aggregate_tokens_respects_prefix_and_missing_keys() {
+        // Only the prefixed keys should be counted; malformed/missing entries
+        // are treated as zero rather than panicking.
+        let theorems = vec![
+            theorem_with_tokens(&[("proof_input_tokens", "10"), ("input_tokens", "999")]),
+            theorem_with_tokens(&[("proof_output_tokens", "not-a-number")]),
+        ];
+
+        let (input, output) = ProofServiceImpl::aggregate_tokens(&theorems, "proof_");
+        assert_eq!(input, 10);
+        assert_eq!(output, 0);
+    }
+}
