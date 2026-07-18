@@ -1,0 +1,65 @@
+# Local end-to-end configuration: no AWS, no gVisor requirement.
+#
+# Use with `docker-compose.e2e.yml` (MinIO) and a host Docker daemon. The
+# security validation is relaxed to what a developer laptop provides while the
+# proving path stays real: Lean actually runs in a hardened `docker run`.
+
+security:
+  # A developer host typically has neither gVisor nor a seccomp env marker, so
+  # relax the *startup posture check*. The container run flags applied by the
+  # sandbox (cap-drop, no-new-privileges, read-only, network none, non-root)
+  # remain in force regardless of these validation toggles.
+  use_gvisor: false
+  run_as_non_root: false
+  run_as_user: 1000
+  run_as_group: 1000
+  drop_all_capabilities: true
+  allow_privilege_escalation: false
+  privileged: false
+  network_isolation: true
+  resource_limits:
+    cpu_limit: 2.0
+    memory_limit: 2147483648 # 2 GiB
+    disk_limit: 5368709120 # 5 GiB
+    network_limit: 104857600
+    process_limit: 256
+    file_descriptor_limit: 1024
+  security_scanning:
+    enable_oss_scanning: false
+    max_critical_vulnerabilities: 0
+    max_high_vulnerabilities: 5
+    scan_timeout_seconds: 300
+
+lean:
+  lean_version: "4.22.0"
+  image: "spec-to-proof/lean-runner:v4.22.0"
+  imports: []
+  default_timeout_seconds: 180
+
+sandbox:
+  runtime: docker
+  network: none
+  workdir: /work
+  pids_limit: 256
+  tmpfs_size_mb: 512
+  read_only_root: true
+  extra_run_args: []
+
+storage:
+  minio:
+    endpoint: "http://localhost:9000"
+    bucket: "proof-artifacts"
+    region: us-east-1
+    key_prefix: proof-artifacts
+    force_path_style: true
+  reference_dir: "./.lean-farm/references"
+
+job:
+  worker_count: 2
+  max_queue_size: 128
+  max_job_duration_seconds: 180
+
+metrics:
+  port: 9090
+  path: /metrics
+  health_port: 8080

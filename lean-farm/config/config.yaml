@@ -1,0 +1,67 @@
+# Default Lean Farm configuration.
+#
+# Every field has a built-in default (see `src/config.rs`); this file documents
+# the production-leaning posture. For a local, AWS-free end-to-end run use
+# `config/local-e2e.yaml` together with `docker-compose.e2e.yml`.
+
+security:
+  # Require gVisor + rootless + seccomp in production. The runner validates the
+  # host posture on startup and refuses to run if these are not satisfied.
+  use_gvisor: true
+  run_as_non_root: true
+  run_as_user: 1000
+  run_as_group: 1000
+  read_only_root_filesystem: true
+  drop_all_capabilities: true
+  allow_privilege_escalation: false
+  privileged: false
+  network_isolation: true
+  resource_limits:
+    cpu_limit: 2.0
+    memory_limit: 4294967296 # 4 GiB
+    disk_limit: 10737418240 # 10 GiB
+    network_limit: 104857600 # 100 MiB/s
+    process_limit: 256
+    file_descriptor_limit: 1024
+
+lean:
+  lean_version: "4.22.0"
+  # Built from lean-farm/lean-runner.Dockerfile (pinned toolchain, offline).
+  image: "spec-to-proof/lean-runner:v4.22.0"
+  # Empty imports => stdlib-only proofs that check offline in the runner image.
+  # Set to ["Mathlib"] when running against a Mathlib-provisioned image.
+  imports: []
+  default_timeout_seconds: 300
+
+sandbox:
+  # `docker` (runc) or `gvisor` (adds --runtime=runsc).
+  runtime: gvisor
+  network: none
+  workdir: /work
+  pids_limit: 256
+  tmpfs_size_mb: 512
+  read_only_root: true
+  extra_run_args: []
+
+storage:
+  s3:
+    bucket: ""
+    region: us-east-1
+    key_prefix: code-bundles
+  minio:
+    endpoint: ""
+    bucket: ""
+    region: us-east-1
+    key_prefix: proof-artifacts
+    force_path_style: true
+  # reference_dir: /var/lean-farm/references
+
+job:
+  worker_count: 10
+  max_queue_size: 1000
+  max_job_duration_seconds: 300
+
+metrics:
+  port: 9090
+  path: /metrics
+  health_port: 8080
