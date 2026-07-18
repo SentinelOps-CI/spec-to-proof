@@ -1,59 +1,107 @@
-use std::error::Error;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::timeout;
-use tracing::{info, warn, error, instrument};
-use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio::sync::RwLock;
+use tracing::{error, info, instrument, warn};
 
+use crate::artifact::{write_reference_to_dir, ProofArtifactReference};
+use crate::config::Config;
+use crate::metrics::Metrics;
+use crate::proto::spec_to_proof::v1::{LeanTheorem, ProofArtifact, ProofStatus, ResourceUsage};
+use crate::sandbox::{Sandbox, SandboxOutcome};
 use crate::{
-    Config, ProofJob, ProofResult, JobQueue, JobPriority, ResourceUsage,
-    LeanFarmError, security::SecurityManager, storage::StorageManager, lean::LeanCompiler
+    lean::LeanCompiler, security::SecurityManager, storage::StorageManager, BoxError, JobQueue,
+    ProofJob, ProofOptions, ProofResult,
 };
+use prost::Message;
 
-#[derive(Debug, Clone)]
+/// Metadata key used to associate a job with the originating spec document, so
+/// the emitted artifact reference can be keyed for the badge service.
+const SPEC_DOCUMENT_ID_KEY: &str = "spec_document_id";
+
+/// Orchestrates the worker pool and the lifecycle of a single proof job.
+///
+/// `JobRunner` is cloneable; clones share the metrics registry and the same
+/// backend clients, but each holds its own `is_running` flag and an independent
+/// view of the queue handle. The shared queue lives behind an `Arc` so all
+/// clones (workers) enqueue/dequeue against the same queue.
+#[derive(Clone)]
 pub struct JobRunner {
     config: Config,
+    /// Retained for sandbox validation hooks used by the container lifecycle.
+    #[allow(dead_code)]
     security_manager: SecurityManager,
     storage_manager: StorageManager,
     lean_compiler: LeanCompiler,
-    job_queue: JobQueue,
+    sandbox: Sandbox,
+    job_queue: Arc<JobQueue>,
+    metrics: Arc<Metrics>,
     worker_count: usize,
     max_job_duration: Duration,
-    is_running: RwLock<bool>,
+    is_running: Arc<RwLock<bool>>,
 }
 
 impl JobRunner {
     pub async fn new(
         config: Config,
         security_manager: SecurityManager,
-    ) -> Result<Self, Box<dyn Error>> {
+        metrics: Arc<Metrics>,
+    ) -> Result<Self, BoxError> {
         let storage_manager = StorageManager::new(&config.storage).await?;
         let lean_compiler = LeanCompiler::new(&config.lean);
-        let job_queue = JobQueue::new(config.job.max_queue_size);
-        
+        let sandbox = Sandbox::from_config(&config);
+        let job_queue = Arc::new(JobQueue::new(config.job.max_queue_size));
+        let worker_count = config.job.worker_count;
+        let max_job_duration = Duration::from_secs(config.job.max_job_duration_seconds);
+
         Ok(Self {
             config,
             security_manager,
             storage_manager,
             lean_compiler,
+            sandbox,
             job_queue,
-            worker_count: 10,
-            max_job_duration: Duration::from_secs(300), // 5 minutes
-            is_running: RwLock::new(false),
+            metrics,
+            worker_count,
+            max_job_duration,
+            is_running: Arc::new(RwLock::new(false)),
         })
     }
 
-    pub async fn start_processing(&self) -> Result<(), Box<dyn Error>> {
+    /// Enqueue a job onto the shared queue.
+    pub async fn enqueue(&self, job: ProofJob) -> Result<(), BoxError> {
+        self.job_queue.enqueue(job).await
+    }
+
+    /// Number of jobs currently queued.
+    pub async fn queue_size(&self) -> usize {
+        self.job_queue.size().await
+    }
+
+    /// True when the container runtime required for real proving is reachable.
+    pub async fn sandbox_available(&self) -> bool {
+        self.sandbox.ensure_available().await.is_ok()
+    }
+
+    /// Run a single job to completion synchronously (process + persist), used by
+    /// [`crate::LeanFarm::prove`] and the end-to-end test path.
+    pub async fn run_job_to_completion(&self, job: ProofJob) -> Result<ProofResult, BoxError> {
+        let result = self.process_job(job).await;
+        self.handle_job_result(&result).await?;
+        Ok(result)
+    }
+
+    pub async fn start_processing(&self) -> Result<(), BoxError> {
         info!("Starting job processing with {} workers", self.worker_count);
-        
+
         {
             let mut is_running = self.is_running.write().await;
             *is_running = true;
         }
-        
+
         let (tx, mut rx) = mpsc::channel(100);
-        
+
         // Start worker pool
         let mut worker_handles = Vec::new();
         for worker_id in 0..self.worker_count {
@@ -64,24 +112,28 @@ impl JobRunner {
             });
             worker_handles.push(handle);
         }
-        
+        // Drop our own sender so the channel closes once all workers stop.
+        drop(tx);
+
         // Process results
         while let Some(result) = rx.recv().await {
-            self.handle_job_result(result).await?;
+            if let Err(e) = self.handle_job_result(&result).await {
+                error!("Failed to handle job result for {}: {}", result.job_id, e);
+            }
         }
-        
+
         // Wait for all workers to complete
         for handle in worker_handles {
             let _ = handle.await;
         }
-        
+
         Ok(())
     }
 
     #[instrument(skip(self, tx))]
     async fn worker_loop(&self, worker_id: usize, tx: mpsc::Sender<ProofResult>) {
         info!("Worker {} started", worker_id);
-        
+
         while *self.is_running.read().await {
             // Get next job from queue
             let job = match self.job_queue.dequeue().await {
@@ -91,344 +143,310 @@ impl JobRunner {
                     continue;
                 }
             };
-            
+
             info!("Worker {} processing job {}", worker_id, job.id);
-            
+
             // Process the job
             let result = self.process_job(job).await;
-            
+
             // Send result back
             if let Err(e) = tx.send(result).await {
                 error!("Failed to send job result: {}", e);
             }
         }
-        
+
         info!("Worker {} stopped", worker_id);
     }
 
-    #[instrument(skip(self, job))]
+    /// Run the full proving pipeline for one job:
+    /// generate self-contained Lean source → execute it in the hardened
+    /// sandbox → build a structured artifact → upload it when storage is
+    /// configured. Failures (compilation errors, unsolved goals, timeouts,
+    /// missing runtime) are captured as a non-successful [`ProofResult`] with a
+    /// structured error message rather than panicking.
+    #[instrument(skip(self, job), fields(job_id = %job.id, theorem = %job.theorem.theorem_name))]
     async fn process_job(&self, job: ProofJob) -> ProofResult {
         let start_time = Instant::now();
-        let mut resource_usage = ResourceUsage::default();
-        
-        info!("Processing job {} with theorem {}", job.id, job.theorem.theorem_name);
-        
-        // Check deadline
+
+        info!(
+            "Processing job {} with theorem {}",
+            job.id, job.theorem.theorem_name
+        );
+
+        // Check deadline before doing any work.
         if let Some(deadline) = job.deadline {
             if Instant::now() > deadline {
-                return ProofResult {
-                    job_id: job.id,
-                    theorem: job.theorem,
-                    proof_artifact: ProofArtifact::default(),
-                    duration_ms: start_time.elapsed().as_millis() as u64,
-                    success: false,
-                    error_message: Some("Job deadline exceeded".to_string()),
-                    resource_usage,
-                };
+                return self.failed_result(
+                    job,
+                    start_time,
+                    "Job deadline exceeded before execution".to_string(),
+                );
             }
         }
-        
-        // Download code bundle from S3
-        let code_bundle_path = match self.download_code_bundle(&job.theorem).await {
-            Ok(path) => path,
+
+        // 1. Generate the self-contained Lean source (deterministic, pure).
+        let source = match self
+            .lean_compiler
+            .generate_proof(&job.theorem, &job.options)
+            .await
+        {
+            Ok(source) => source,
             Err(e) => {
-                return ProofResult {
-                    job_id: job.id.clone(),
-                    theorem: job.theorem,
-                    proof_artifact: ProofArtifact::default(),
-                    duration_ms: start_time.elapsed().as_millis() as u64,
-                    success: false,
-                    error_message: Some(format!("Failed to download code bundle: {}", e)),
-                    resource_usage,
-                };
+                return self.failed_result(
+                    job,
+                    start_time,
+                    format!("failed to generate Lean source: {e}"),
+                );
             }
         };
-        
-        // Run Lean compilation and proof generation
-        let result = timeout(self.max_job_duration, async {
-            self.run_lean_proof(&job, &code_bundle_path).await
-        }).await;
-        
-        let (theorem, proof_artifact, success, error_message) = match result {
-            Ok(Ok((theorem, proof_artifact))) => (theorem, proof_artifact, true, None),
-            Ok(Err(e)) => (job.theorem.clone(), ProofArtifact::default(), false, Some(e.to_string())),
-            Err(_) => (job.theorem.clone(), ProofArtifact::default(), false, Some("Job timeout".to_string())),
+
+        // 2. Execute the source in the hardened sandbox with a bounded budget.
+        let budget = self.time_budget(&job.options);
+        let outcome = match self.sandbox.run_lean_source(&source, budget).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // Runtime unavailable or a spawn error: this is an
+                // infrastructure fault, surfaced verbatim.
+                return self.failed_result(job, start_time, e.to_string());
+            }
         };
-        
-        // Upload proof artifact to MinIO
+
+        // 3. Build the structured artifact from the real execution outcome.
+        let proof_artifact =
+            self.artifact_from_outcome(&job.theorem, &job.options, &source, &outcome);
+        let success = outcome.success;
+        let error_message = outcome.failure_message();
+
+        // 4. Upload the artifact when it represents a real proof and storage is
+        //    configured (a `NotConfigured` sink is logged, not fatal).
         if success {
             if let Err(e) = self.upload_proof_artifact(&proof_artifact).await {
-                error!("Failed to upload proof artifact: {}", e);
+                warn!(
+                    "Failed to upload proof artifact {}: {}",
+                    proof_artifact.id, e
+                );
             }
         }
-        
-        let duration_ms = start_time.elapsed().as_millis() as u64;
-        
+
+        let resource_usage = proof_artifact.resource_usage.clone().unwrap_or_default();
+
         ProofResult {
             job_id: job.id,
-            theorem,
+            theorem: job.theorem,
             proof_artifact,
-            duration_ms,
+            duration_ms: start_time.elapsed().as_millis() as u64,
             success,
             error_message,
             resource_usage,
         }
     }
 
-    async fn download_code_bundle(&self, theorem: &LeanTheorem) -> Result<PathBuf, Box<dyn Error>> {
-        let bundle_key = format!("{}/{}", self.config.storage.s3.key_prefix, theorem.content_sha256);
-        let local_path = PathBuf::from("/tmp").join(&theorem.content_sha256);
-        
-        info!("Downloading code bundle from S3: {}", bundle_key);
-        
-        self.storage_manager.download_from_s3(&bundle_key, &local_path).await?;
-        
-        Ok(local_path)
+    /// Compute the effective time budget for a job: the smaller of the job's
+    /// requested timeout and the runner-wide ceiling, and never zero.
+    fn time_budget(&self, options: &ProofOptions) -> Duration {
+        let requested = Duration::from_secs(options.timeout_seconds.max(1) as u64);
+        requested
+            .min(self.max_job_duration)
+            .max(Duration::from_secs(1))
     }
 
-    async fn run_lean_proof(
+    /// Build a [`ProofArtifact`] from a completed sandbox run. The artifact is
+    /// content-addressed by the SHA-256 of the exact source that was checked,
+    /// which keeps storage keys stable and deduplicated.
+    fn artifact_from_outcome(
         &self,
-        job: &ProofJob,
-        code_bundle_path: &PathBuf,
-    ) -> Result<(LeanTheorem, ProofArtifact), Box<dyn Error>> {
-        info!("Running Lean proof for theorem {}", job.theorem.theorem_name);
-        
-        // Create Docker container with Lean image
-        let container_id = self.create_lean_container(code_bundle_path).await?;
-        
-        // Mount S3 code bundle read-only
-        self.mount_code_bundle(&container_id, code_bundle_path).await?;
-        
-        // Run lake build
-        let build_result = self.run_lake_build(&container_id).await?;
-        if !build_result.success {
-            return Err(LeanFarmError::LeanCompilation(build_result.error_message).into());
-        }
-        
-        // Run proof generation
-        let proof_result = self.run_proof_generation(&container_id, &job.theorem, &job.options).await?;
-        
-        // Clean up container
-        self.cleanup_container(&container_id).await?;
-        
-        Ok((job.theorem.clone(), proof_result))
-    }
-
-    async fn create_lean_container(&self, code_bundle_path: &PathBuf) -> Result<String, Box<dyn Error>> {
-        let lean_version = std::env::var("LEAN_VERSION").unwrap_or_else(|_| "4.7.0".to_string());
-        let image_name = format!("leanprover/lean4:{}", lean_version);
-        
-        // Docker run command with security restrictions
-        let output = tokio::process::Command::new("docker")
-            .args(&[
-                "run",
-                "--rm",
-                "--detach",
-                "--security-opt=seccomp=unconfined",
-                "--security-opt=no-new-privileges",
-                "--read-only",
-                "--tmpfs=/tmp:rw,noexec,nosuid,size=1g",
-                "--tmpfs=/var/lean-farm:rw,noexec,nosuid,size=2g",
-                "--user=1000:1000",
-                "--cpus=2",
-                "--memory=4g",
-                "--network=none",
-                "--name", &format!("lean-farm-{}", uuid::Uuid::new_v4()),
-                &image_name,
-                "sleep", "3600"
-            ])
-            .output()
-            .await?;
-        
-        if !output.status.success() {
-            return Err(LeanFarmError::JobExecution(
-                format!("Failed to create container: {}", String::from_utf8_lossy(&output.stderr))
-            ).into());
-        }
-        
-        let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        info!("Created Lean container: {}", container_id);
-        
-        Ok(container_id)
-    }
-
-    async fn mount_code_bundle(&self, container_id: &str, code_bundle_path: &PathBuf) -> Result<(), Box<dyn Error>> {
-        let mount_path = "/var/lean-farm/code";
-        
-        let output = tokio::process::Command::new("docker")
-            .args(&[
-                "cp",
-                code_bundle_path.to_str().unwrap(),
-                &format!("{}:{}", container_id, mount_path)
-            ])
-            .output()
-            .await?;
-        
-        if !output.status.success() {
-            return Err(LeanFarmError::JobExecution(
-                format!("Failed to mount code bundle: {}", String::from_utf8_lossy(&output.stderr))
-            ).into());
-        }
-        
-        info!("Mounted code bundle in container {}", container_id);
-        Ok(())
-    }
-
-    async fn run_lake_build(&self, container_id: &str) -> Result<BuildResult, Box<dyn Error>> {
-        let timeout_seconds = std::env::var("LAKE_BUILD_TIMEOUT")
-            .unwrap_or_else(|_| "300".to_string())
-            .parse::<u64>()?;
-        
-        let output = timeout(
-            Duration::from_secs(timeout_seconds),
-            tokio::process::Command::new("docker")
-                .args(&[
-                    "exec",
-                    container_id,
-                    "lake", "build"
-                ])
-                .output()
-        ).await??;
-        
-        let success = output.status.success();
-        let error_message = if !success {
-            Some(String::from_utf8_lossy(&output.stderr).to_string())
-        } else {
-            None
-        };
-        
-        Ok(BuildResult {
-            success,
-            error_message,
-            output: String::from_utf8_lossy(&output.stdout).to_string(),
-        })
-    }
-
-    async fn run_proof_generation(
-        &self,
-        container_id: &str,
         theorem: &LeanTheorem,
         options: &ProofOptions,
-    ) -> Result<ProofArtifact, Box<dyn Error>> {
-        let start_time = Instant::now();
-        
-        // Generate proof using Lean compiler
-        let proof_code = self.lean_compiler.generate_proof(theorem, options).await?;
-        
-        // Execute proof in container
-        let output = tokio::process::Command::new("docker")
-            .args(&[
-                "exec",
-                container_id,
-                "lean",
-                "--run",
-                "/var/lean-farm/code/proof.lean"
-            ])
-            .output()
-            .await?;
-        
-        let success = output.status.success();
-        let logs = String::from_utf8_lossy(&output.stdout).to_string();
-        let error_logs = String::from_utf8_lossy(&output.stderr).to_string();
-        
-        let duration_ms = start_time.elapsed().as_millis() as u64;
-        
-        Ok(ProofArtifact {
+        source: &str,
+        outcome: &SandboxOutcome,
+    ) -> ProofArtifact {
+        let duration_ms = outcome.duration.as_millis() as i64;
+        let mut metadata = HashMap::new();
+        if let Some(spec_doc) = options.metadata.get(SPEC_DOCUMENT_ID_KEY) {
+            metadata.insert(SPEC_DOCUMENT_ID_KEY.to_string(), spec_doc.clone());
+        }
+        metadata.insert(
+            "exit_code".to_string(),
+            outcome
+                .exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        );
+        metadata.insert("timed_out".to_string(), outcome.timed_out.to_string());
+        metadata.insert("sandbox_image".to_string(), self.config.lean.image.clone());
+
+        ProofArtifact {
             id: format!("proof-{}", uuid::Uuid::new_v4()),
-            content_sha256: sha256::digest(&proof_code),
+            content_sha256: sha256::digest(source),
             theorem_id: theorem.id.clone(),
             invariant_id: theorem.source_invariant_id.clone(),
-            status: if success { ProofStatus::Success as i32 } else { ProofStatus::Failed as i32 },
+            status: if outcome.success {
+                ProofStatus::Success as i32
+            } else {
+                ProofStatus::Failed as i32
+            },
             attempted_at: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
             duration_ms,
-            output: logs,
-            logs: vec![error_logs],
+            output: outcome.stdout.clone(),
+            logs: outcome.stderr.lines().map(|l| l.to_string()).collect(),
             resource_usage: Some(ResourceUsage {
-                cpu_seconds: duration_ms as f64 / 1000.0,
-                memory_bytes: 0, // Would be tracked in real implementation
-                disk_bytes: 0,
+                // The sandbox is the CPU-bound worker here, so wall-clock time
+                // is a faithful proxy for CPU seconds consumed by the run.
+                cpu_seconds: outcome.duration.as_secs_f64(),
+                memory_bytes: self.config.security.resource_limits.memory_limit as i64,
+                disk_bytes: source.len() as i64,
                 network_bytes: 0,
             }),
             proof_strategy: options.proof_strategy.clone(),
-            confidence_score: 0.95,
-            metadata: std::collections::HashMap::new(),
-        })
+            // Confidence is only meaningful once Lean has actually checked the
+            // proof: certainty on success, none on failure.
+            confidence_score: if outcome.success { 1.0 } else { 0.0 },
+            metadata,
+        }
     }
 
-    async fn cleanup_container(&self, container_id: &str) -> Result<(), Box<dyn Error>> {
-        let _ = tokio::process::Command::new("docker")
-            .args(&["stop", container_id])
-            .output()
-            .await;
-        
-        let _ = tokio::process::Command::new("docker")
-            .args(&["rm", container_id])
-            .output()
-            .await;
-        
-        info!("Cleaned up container {}", container_id);
-        Ok(())
+    /// Construct a failed [`ProofResult`] with a structured message. Centralised
+    /// so every early-return path is consistent.
+    fn failed_result(&self, job: ProofJob, start_time: Instant, message: String) -> ProofResult {
+        warn!("Job {} failed: {}", job.id, message);
+        let mut artifact = ProofArtifact {
+            id: format!("proof-{}", uuid::Uuid::new_v4()),
+            theorem_id: job.theorem.id.clone(),
+            invariant_id: job.theorem.source_invariant_id.clone(),
+            status: ProofStatus::Failed as i32,
+            attempted_at: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            proof_strategy: job.options.proof_strategy.clone(),
+            ..Default::default()
+        };
+        if let Some(spec_doc) = job.options.metadata.get(SPEC_DOCUMENT_ID_KEY) {
+            artifact
+                .metadata
+                .insert(SPEC_DOCUMENT_ID_KEY.to_string(), spec_doc.clone());
+        }
+        ProofResult {
+            job_id: job.id,
+            theorem: job.theorem,
+            proof_artifact: artifact,
+            duration_ms: start_time.elapsed().as_millis() as u64,
+            success: false,
+            error_message: Some(message),
+            resource_usage: ResourceUsage::default(),
+        }
     }
 
-    async fn upload_proof_artifact(&self, proof_artifact: &ProofArtifact) -> Result<(), Box<dyn Error>> {
-        let artifact_key = format!("{}/{}", self.config.storage.minio.key_prefix, proof_artifact.id);
-        
-        info!("Uploading proof artifact to MinIO: {}", artifact_key);
-        
+    async fn upload_proof_artifact(&self, proof_artifact: &ProofArtifact) -> Result<(), BoxError> {
+        let artifact_key = format!(
+            "{}/{}",
+            self.config.storage.minio.key_prefix, proof_artifact.id
+        );
+
+        info!(
+            "Uploading proof artifact to artifact store: {}",
+            artifact_key
+        );
+
         // Serialize proof artifact to protobuf
         let artifact_bytes = proof_artifact.encode_to_vec();
-        
-        self.storage_manager.upload_to_minio(&artifact_key, &artifact_bytes).await?;
-        
+
+        self.storage_manager
+            .upload_to_minio(&artifact_key, &artifact_bytes)
+            .await?;
+
         info!("Successfully uploaded proof artifact {}", proof_artifact.id);
         Ok(())
     }
 
-    async fn handle_job_result(&self, result: ProofResult) -> Result<(), Box<dyn Error>> {
+    async fn handle_job_result(&self, result: &ProofResult) -> Result<(), BoxError> {
         if result.success {
-            info!("Job {} completed successfully in {}ms", result.job_id, result.duration_ms);
+            info!(
+                "Job {} completed successfully in {}ms",
+                result.job_id, result.duration_ms
+            );
         } else {
             warn!("Job {} failed: {:?}", result.job_id, result.error_message);
         }
-        
+
         // Update metrics
-        self.update_job_metrics(&result).await;
-        
-        // Store result in persistent storage
-        self.storage_manager.store_job_result(&result).await?;
-        
+        self.update_job_metrics(result).await;
+
+        // Store the compact result summary in persistent storage (no-op when no
+        // artifact bucket is configured).
+        self.storage_manager.store_job_result(result).await?;
+
+        // Emit the cross-service artifact reference consumed by the badge
+        // service. This is best-effort: a mirroring failure must not fail the
+        // job, so it is logged rather than propagated.
+        self.emit_artifact_reference(result).await;
+
         Ok(())
     }
 
-    async fn update_job_metrics(&self, result: &ProofResult) {
-        // Update Prometheus metrics
-        // This would integrate with the metrics server
+    /// Write the [`ProofArtifactReference`] for a completed job to the local
+    /// mirror directory (when configured) and to the artifact bucket under the
+    /// `references/` prefix (when configured).
+    async fn emit_artifact_reference(&self, result: &ProofResult) {
+        let spec_doc = result
+            .proof_artifact
+            .metadata
+            .get(SPEC_DOCUMENT_ID_KEY)
+            .map(String::as_str);
+        let reference = ProofArtifactReference::from_result(result, spec_doc);
+
+        if let Some(dir) = &self.config.storage.reference_dir {
+            match write_reference_to_dir(std::path::Path::new(dir), &reference).await {
+                Ok(path) => info!("Mirrored artifact reference to {}", path.display()),
+                Err(e) => warn!("Failed to mirror artifact reference: {}", e),
+            }
+        }
+
+        if !self.config.storage.minio.bucket.is_empty() {
+            match reference.to_json() {
+                Ok(payload) => {
+                    let key = format!(
+                        "{}/references/{}",
+                        self.config.storage.minio.key_prefix,
+                        reference.file_name()
+                    );
+                    if let Err(e) = self.storage_manager.upload_to_minio(&key, &payload).await {
+                        warn!("Failed to upload artifact reference to store: {}", e);
+                    }
+                }
+                Err(e) => warn!("Failed to serialise artifact reference: {}", e),
+            }
+        }
     }
 
-    pub async fn start_health_server(&self) -> Result<(), Box<dyn Error>> {
-        use axum::{
-            routing::get,
-            Router,
-            http::StatusCode,
-            Json,
-        };
+    async fn update_job_metrics(&self, result: &ProofResult) {
+        self.metrics.record_job(result.success, result.duration_ms);
+    }
+
+    pub async fn start_health_server(&self) -> Result<(), BoxError> {
+        use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
         use serde_json::json;
-        
+
+        let port = self.config.metrics.health_port;
+        let queue = self.job_queue.clone();
+
         let app = Router::new()
             .route("/health", get(|| async { StatusCode::OK }))
             .route("/ready", get(|| async { StatusCode::OK }))
-            .route("/metrics", get(|| async { 
-                Json(json!({
-                    "queue_size": 0, // Would get from job_queue
-                    "active_workers": 0,
-                    "uptime_seconds": 0,
-                }))
-            }));
-        
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-        info!("Health server started on port 8080");
-        
-        axum::serve(listener, app).await?;
+            .route(
+                "/status",
+                get(|State(queue): State<Arc<JobQueue>>| async move {
+                    Json(json!({ "queue_size": queue.size().await }))
+                }),
+            )
+            .with_state(queue);
+
+        let addr = format!("0.0.0.0:{port}");
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .map_err(|e| format!("failed to bind health server on {addr}: {e}"))?;
+        info!("health server listening on {addr}");
+
+        axum::serve(listener, app)
+            .await
+            .map_err(|e| format!("health server error: {e}"))?;
         Ok(())
     }
 
@@ -438,29 +456,3 @@ impl JobRunner {
         *is_running = false;
     }
 }
-
-impl Clone for JobRunner {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            security_manager: self.security_manager.clone(),
-            storage_manager: self.storage_manager.clone(),
-            lean_compiler: self.lean_compiler.clone(),
-            job_queue: JobQueue::new(self.config.job.max_queue_size),
-            worker_count: self.worker_count,
-            max_job_duration: self.max_job_duration,
-            is_running: RwLock::new(false),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct BuildResult {
-    pub success: bool,
-    pub error_message: Option<String>,
-    pub output: String,
-}
-
-// Import necessary types from proto
-use crate::proto::proof::v1::*;
-use crate::proto::spec_to_proof::v1::*; 

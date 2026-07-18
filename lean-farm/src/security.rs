@@ -1,11 +1,9 @@
-use std::error::Error;
-use std::process::Command;
 use std::time::Duration;
 use tokio::time::timeout;
-use tracing::{info, warn, error};
+use tracing::info;
 use serde::{Deserialize, Serialize};
 
-use crate::LeanFarmError;
+use crate::{BoxError, LeanFarmError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityConfig {
@@ -94,6 +92,7 @@ impl Default for SecurityConfig {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct SecurityManager {
     config: SecurityConfig,
     runtime_info: RuntimeInfo,
@@ -109,7 +108,7 @@ pub struct RuntimeInfo {
 }
 
 impl SecurityManager {
-    pub fn new(config: &SecurityConfig) -> Result<Self, Box<dyn Error>> {
+    pub fn new(config: &SecurityConfig) -> Result<Self, BoxError> {
         let runtime_info = Self::detect_runtime_info()?;
         
         Ok(Self {
@@ -118,7 +117,7 @@ impl SecurityManager {
         })
     }
 
-    pub async fn validate_environment(&self) -> Result<(), Box<dyn Error>> {
+    pub async fn validate_environment(&self) -> Result<(), BoxError> {
         info!("Validating security environment");
         
         // Check runtime requirements
@@ -139,7 +138,7 @@ impl SecurityManager {
         Ok(())
     }
 
-    fn validate_runtime(&self) -> Result<(), Box<dyn Error>> {
+    fn validate_runtime(&self) -> Result<(), BoxError> {
         // Check if running with gVisor
         if self.config.use_gvisor && !self.runtime_info.is_gvisor {
             return Err(LeanFarmError::Security(
@@ -165,7 +164,7 @@ impl SecurityManager {
         Ok(())
     }
 
-    fn validate_security_config(&self) -> Result<(), Box<dyn Error>> {
+    fn validate_security_config(&self) -> Result<(), BoxError> {
         // Validate user/group IDs
         if self.config.run_as_user == 0 {
             return Err(LeanFarmError::Security(
@@ -198,7 +197,7 @@ impl SecurityManager {
         Ok(())
     }
 
-    fn validate_resource_limits(&self) -> Result<(), Box<dyn Error>> {
+    fn validate_resource_limits(&self) -> Result<(), BoxError> {
         // Check CPU limit
         if self.config.resource_limits.cpu_limit <= 0.0 {
             return Err(LeanFarmError::Security(
@@ -224,7 +223,7 @@ impl SecurityManager {
         Ok(())
     }
 
-    async fn run_security_scan(&self) -> Result<(), Box<dyn Error>> {
+    async fn run_security_scan(&self) -> Result<(), BoxError> {
         info!("Running security scan");
         
         let scan_timeout = Duration::from_secs(self.config.security_scanning.scan_timeout_seconds);
@@ -258,7 +257,7 @@ impl SecurityManager {
         Ok(())
     }
 
-    async fn perform_security_scan(&self) -> Result<SecurityScanResult, Box<dyn Error>> {
+    async fn perform_security_scan(&self) -> Result<SecurityScanResult, BoxError> {
         // In a real implementation, this would run actual security scanning tools
         // like Trivy, Snyk, or similar
         
@@ -274,7 +273,7 @@ impl SecurityManager {
         Ok(result)
     }
 
-    fn detect_runtime_info() -> Result<RuntimeInfo, Box<dyn Error>> {
+    fn detect_runtime_info() -> Result<RuntimeInfo, BoxError> {
         // Detect gVisor runtime
         let is_gvisor = std::env::var("RUNSC_ROOT_DIR").is_ok();
         
@@ -326,9 +325,9 @@ mod tests {
         let config = SecurityConfig::default();
         let manager = SecurityManager::new(&config).unwrap();
         
-        assert_eq!(manager.config.use_gvisor, true);
-        assert_eq!(manager.config.run_as_non_root, true);
-        assert_eq!(manager.config.drop_all_capabilities, true);
+        assert!(manager.config.use_gvisor);
+        assert!(manager.config.run_as_non_root);
+        assert!(manager.config.drop_all_capabilities);
     }
 
     #[tokio::test]
