@@ -4,6 +4,18 @@ members = [
     "proto",
     "nlp",
     "proof",
+    "platform/gh-app",
+]
+# These crates live in the tree but are intentionally not part of the workspace
+# build. They are standalone binaries that carry their own `Cargo.lock` with
+# service-specific dependency pins (e.g. `ingest` -> async-nats/AES-GCM/AWS,
+# `lean-farm` -> aws-sdk-s3/axum) that are downgraded for the pinned MSRV.
+# Excluding them keeps `cargo <cmd> --workspace` reproducible while each crate
+# still builds and tests on its own. See docs/adr/0001 for the rationale.
+exclude = [
+    "ingest",
+    "lean-farm",
+    "proto/fuzz",
 ]
 
 [workspace.package]
