@@ -1,8 +1,8 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::Path;
 use serde::{Deserialize, Serialize};
 use anyhow::{Result, Context};
-use config::{Config, ConfigError, Environment, File};
+use config::{Config, File};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +33,14 @@ pub struct GitHubAppConfig {
     pub badge_context: String,
     pub badge_description: String,
     pub badge_target_url: String,
+    /// Directory containing proof-artifact reference records written by the
+    /// Lean proof farm (its `storage.reference_dir`, or a mount synced from the
+    /// artifact bucket). When set, the badge service reads real proof outcomes
+    /// from here via a `DirectoryProofArtifactSource`. `None` leaves the badge
+    /// service without a proof source (it then fails loudly rather than
+    /// fabricating a status).
+    #[serde(default)]
+    pub proof_reference_dir: Option<String>,
     
     // Sigstore settings
     pub sigstore_rekor_url: String,
@@ -92,6 +100,7 @@ impl Default for GitHubAppConfig {
             badge_context: "spec-to-proof/verification".to_string(),
             badge_description: "Spec-to-Proof verification status".to_string(),
             badge_target_url: "https://spec-to-proof.com/verification".to_string(),
+            proof_reference_dir: None,
             sigstore_rekor_url: "https://rekor.sigstore.dev".to_string(),
             sigstore_fulcio_url: "https://fulcio.sigstore.dev".to_string(),
             sigstore_oidc_issuer: "https://oauth2.sigstore.dev/auth".to_string(),
@@ -112,79 +121,133 @@ impl Default for GitHubAppConfig {
     }
 }
 
+/// Deep-merge JSON object `overlay` onto `base` (overlay wins). Non-object
+/// overlays replace the base value entirely; null overlays are ignored.
+fn deep_merge(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    use serde_json::Value;
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (k, v) in overlay_map {
+                deep_merge(base_map.entry(k).or_insert(Value::Null), v);
+            }
+        }
+        (base_slot, overlay) if !overlay.is_null() => {
+            *base_slot = overlay;
+        }
+        _ => {}
+    }
+}
+
 impl GitHubAppConfig {
-    pub fn load() -> Result<Self> {
-        let config_path = env::var("CONFIG_PATH").unwrap_or_else(|_| "config".to_string());
-        let environment = env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
-        
-        info!("Loading configuration from {} with environment {}", config_path, environment);
-        
-        let config = Config::builder()
-            // Start with default settings
-            .add_source(File::from(PathBuf::from(&config_path).join("default.yaml")).required(false))
-            // Add environment-specific settings
-            .add_source(File::from(PathBuf::from(&config_path).join(format!("{}.yaml", environment))).required(false))
-            // Add local settings
-            .add_source(File::from(PathBuf::from(&config_path).join("local.yaml")).required(false))
-            // Add environment variables with prefix
-            .add_source(Environment::with_prefix("GH_APP").separator("__"))
-            // Add secrets from AWS Secrets Manager
-            .add_source(Environment::with_prefix("GH_APP_SECRETS").separator("__"))
+    /// Load configuration from the default path (`CONFIG_PATH` env or
+    /// `config/default.yaml`), overlaying environment variables and,
+    /// optionally, AWS Secrets Manager (with the `aws-secrets` feature).
+    pub async fn load() -> Result<Self> {
+        let path = env::var("CONFIG_PATH").unwrap_or_else(|_| "config/default.yaml".to_string());
+        Self::load_from(&path).await
+    }
+
+    /// Load configuration from an explicit file path. Missing files are
+    /// tolerated (defaults + environment are still applied). The result is
+    /// validated before being returned.
+    pub async fn load_from(path: &str) -> Result<Self> {
+        info!("Loading configuration from {}", path);
+        #[allow(unused_mut)]
+        let mut config = Self::from_file_and_env(path)?;
+
+        #[cfg(feature = "aws-secrets")]
+        if !config.aws_secrets_arn.is_empty() {
+            config.load_secrets_from_aws().await?;
+        }
+
+        config.validate()?;
+        info!("Configuration loaded successfully");
+        Ok(config)
+    }
+
+    /// Merge defaults, an optional config file, and `GH_APP_*` environment
+    /// overrides into a fully-populated config (no validation).
+    pub fn from_file_and_env(path: &str) -> Result<Self> {
+        // Merge the file (if present) over the serialized defaults so that
+        // partial config files are supported without every field being required.
+        let settings = Config::builder()
+            .add_source(File::from(Path::new(path)).required(false))
             .build()
             .context("Failed to build configuration")?;
-        
-        let mut app_config: GitHubAppConfig = config.try_deserialize()
-            .context("Failed to deserialize configuration")?;
-        
-        // Load secrets from AWS Secrets Manager if configured
-        if !app_config.aws_secrets_arn.is_empty() {
-            app_config.load_secrets_from_aws().await?;
+        let file_value: serde_json::Value = settings.try_deserialize().unwrap_or(serde_json::Value::Null);
+
+        let mut merged = serde_json::to_value(Self::default())
+            .context("Failed to serialize default configuration")?;
+        deep_merge(&mut merged, file_value);
+
+        let mut config: GitHubAppConfig =
+            serde_json::from_value(merged).context("Failed to deserialize configuration")?;
+
+        // Direct environment overrides (highest precedence).
+        if let Ok(v) = env::var("GH_APP_ID") {
+            config.app_id = v;
         }
-        
-        // Validate configuration
-        app_config.validate()?;
-        
-        info!("Configuration loaded successfully");
-        Ok(app_config)
+        if let Ok(v) = env::var("GH_APP_PRIVATE_KEY") {
+            config.private_key = v;
+        }
+        if let Ok(v) = env::var("GH_APP_WEBHOOK_SECRET") {
+            config.webhook_secret = v;
+        }
+        if let Ok(v) = env::var("GH_APP_INSTALLATION_ID") {
+            config.installation_id = v;
+        }
+        if let Ok(v) = env::var("GH_APP_HOST") {
+            config.host = v;
+        }
+        if let Ok(v) = env::var("GH_APP_PORT") {
+            if let Ok(port) = v.parse::<u16>() {
+                config.port = port;
+            }
+        }
+        if let Ok(v) = env::var("PROOF_REFERENCE_DIR") {
+            if !v.trim().is_empty() {
+                config.proof_reference_dir = Some(v);
+            }
+        }
+
+        Ok(config)
     }
-    
+
+    #[cfg(feature = "aws-secrets")]
     async fn load_secrets_from_aws(&mut self) -> Result<()> {
+        use aws_config::{BehaviorVersion, Region};
         use aws_sdk_secretsmanager::Client as SecretsClient;
-        use aws_config::BehaviorVersion;
-        
+
         let aws_config = aws_config::defaults(BehaviorVersion::latest())
-            .region(aws_sdk_sts::Region::new(self.aws_region.clone()))
+            .region(Region::new(self.aws_region.clone()))
             .load()
             .await;
-        
+
         let secrets_client = SecretsClient::new(&aws_config);
-        
+
         let secret_response = secrets_client
             .get_secret_value()
             .secret_id(&self.aws_secrets_arn)
             .send()
             .await
             .context("Failed to retrieve secret from AWS Secrets Manager")?;
-        
+
         if let Some(secret_string) = secret_response.secret_string() {
-            let secrets: serde_json::Value = serde_json::from_str(secret_string)
-                .context("Failed to parse secrets JSON")?;
-            
-            // Update configuration with secrets
-            if let Some(app_id) = secrets.get("app_id").and_then(|v| v.as_str()) {
-                self.app_id = app_id.to_string();
-            }
-            if let Some(private_key) = secrets.get("private_key").and_then(|v| v.as_str()) {
-                self.private_key = private_key.to_string();
-            }
-            if let Some(webhook_secret) = secrets.get("webhook_secret").and_then(|v| v.as_str()) {
-                self.webhook_secret = webhook_secret.to_string();
-            }
-            if let Some(client_secret) = secrets.get("client_secret").and_then(|v| v.as_str()) {
-                self.client_secret = client_secret.to_string();
+            let secrets: serde_json::Value =
+                serde_json::from_str(secret_string).context("Failed to parse secrets JSON")?;
+
+            for (field, target) in [
+                ("app_id", &mut self.app_id),
+                ("private_key", &mut self.private_key),
+                ("webhook_secret", &mut self.webhook_secret),
+                ("client_secret", &mut self.client_secret),
+            ] {
+                if let Some(value) = secrets.get(field).and_then(|v| v.as_str()) {
+                    *target = value.to_string();
+                }
             }
         }
-        
+
         Ok(())
     }
     

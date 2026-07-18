@@ -2,44 +2,87 @@
 name = "gh-app"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
+# HTTP server / client
 axum = "0.7"
-tokio = { version = "1.0", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-full"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+config = "0.14"
+clap = { version = "4", features = ["derive"] }
+
+# Observability
 tracing = "0.1"
-tracing-subscriber = "0.3"
-anyhow = "1.0"
-thiserror = "1.0"
-reqwest = { version = "0.11", features = ["json"] }
-jsonwebtoken = "9.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# Errors
+anyhow = "1"
+thiserror = "1"
+
+# Crypto / auth
+jsonwebtoken = "9"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.0", features = ["v4"] }
-aws-sdk-secretsmanager = "1.0"
-aws-sdk-s3 = "1.0"
-aws-sdk-kms = "1.0"
-redis = { version = "0.23", features = ["tokio-comp"] }
-temporal-sdk = "1.0"
-temporal-sdk-core = "1.0"
-temporal-client = "1.0"
-async-trait = "0.1"
-futures = "0.3"
-tower = "0.4"
-tower-http = { version = "0.4", features = ["cors", "trace"] }
-metrics = "0.21"
-prometheus = "0.13"
-opentelemetry = { version = "0.20", features = ["rt-tokio"] }
-opentelemetry-jaeger = "0.19"
-tonic = "0.10"
-prost = "0.12"
+base64 = "0.21"
+rsa = { version = "0.9", features = ["pem"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+x509-parser = "0.16"
 
-[build-dependencies]
-tonic-build = "0.10"
+# Misc
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+redis = { version = "0.24", features = ["tokio-comp"] }
+
+# Optional: SMTP email alert transport (enable with `--features email-smtp`).
+lettre = { version = "0.11", default-features = false, features = [
+    "tokio1",
+    "tokio1-rustls-tls",
+    "smtp-transport",
+    "builder",
+], optional = true }
+
+# Optional: AWS Secrets Manager backed configuration.
+aws-config = { version = "1", optional = true }
+aws-sdk-secretsmanager = { version = "1", optional = true }
+aws-sdk-sts = { version = "1", optional = true }
+
+# Optional: AWS cost-governance integrations (Cost Explorer, SES, EventBridge,
+# ECS, Lambda). These pull in several large AWS SDK crates, so they are gated
+# behind the `aws-governance` feature and are not built by default.
+aws-sdk-costexplorer = { version = "1", optional = true }
+aws-sdk-ses = { version = "1", optional = true }
+aws-sdk-cloudwatchevents = { version = "1", optional = true }
+aws-sdk-ecs = { version = "1", optional = true }
+aws-sdk-lambda = { version = "1", optional = true }
+aws-smithy-types = { version = "1", optional = true }
+
+[features]
+default = []
+email-smtp = ["dep:lettre"]
+aws-secrets = ["dep:aws-config", "dep:aws-sdk-secretsmanager", "dep:aws-sdk-sts"]
+aws-governance = [
+    "dep:aws-config",
+    "dep:aws-sdk-costexplorer",
+    "dep:aws-sdk-ses",
+    "dep:aws-sdk-cloudwatchevents",
+    "dep:aws-sdk-ecs",
+    "dep:aws-sdk-lambda",
+    "dep:aws-smithy-types",
+]
 
 [dev-dependencies]
 tokio-test = "0.4"
-wiremock = "0.5" 
+wiremock = "0.6"

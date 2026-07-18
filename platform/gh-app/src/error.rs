@@ -67,8 +67,8 @@ impl From<jsonwebtoken::errors::Error> for GitHubAppError {
     }
 }
 
-impl From<hmac::crypto_mac::InvalidKeyLength> for GitHubAppError {
-    fn from(err: hmac::crypto_mac::InvalidKeyLength) -> Self {
+impl From<hmac::digest::InvalidLength> for GitHubAppError {
+    fn from(err: hmac::digest::InvalidLength) -> Self {
         GitHubAppError::Auth(format!("Invalid key length: {}", err))
     }
 }

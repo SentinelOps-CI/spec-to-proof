@@ -1,22 +1,25 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use reqwest::{Client, header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT, ACCEPT}};
 use serde::{Deserialize, Serialize};
-use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey, Algorithm};
+use jsonwebtoken::{encode, Header, EncodingKey, Algorithm};
 use chrono::{Utc, Duration as ChronoDuration};
 use anyhow::{Result, Context};
-use tracing::{info, warn, error};
-use uuid::Uuid;
+use tokio::sync::Mutex;
+use tracing::info;
 
 use crate::config::GitHubAppConfig;
 use crate::proto::gh_app::v1::*;
 
+/// Thin GitHub REST client. Caches are behind `Arc<Mutex<..>>` so the client is
+/// cheaply cloneable and shareable behind an `Arc` while remaining `&self`.
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
     config: GitHubAppConfig,
     http_client: Client,
-    jwt_cache: HashMap<String, (String, Instant)>,
-    installation_token_cache: HashMap<String, (String, Instant)>,
+    jwt_cache: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+    installation_token_cache: Arc<Mutex<HashMap<String, (String, Instant)>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,7 +45,7 @@ struct StatusRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct PullRequest {
+pub struct PullRequest {
     id: String,
     number: String,
     title: String,
@@ -71,7 +74,7 @@ struct User {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Repository {
+pub struct Repository {
     id: String,
     name: String,
     full_name: String,
@@ -95,12 +98,28 @@ impl GitHubClient {
         Ok(Self {
             config: config.clone(),
             http_client,
-            jwt_cache: HashMap::new(),
-            installation_token_cache: HashMap::new(),
+            jwt_cache: Arc::new(Mutex::new(HashMap::new())),
+            installation_token_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
     
-    pub async fn create_jwt(&mut self) -> Result<String> {
+    pub async fn create_jwt(&self) -> Result<String> {
+        {
+            let cache = self.jwt_cache.lock().await;
+            if let Some((token, created_at)) = cache.get("jwt") {
+                // App JWTs are valid for 10 minutes; serve cached until 9.
+                if created_at.elapsed() < Duration::from_secs(540) {
+                    return Ok(token.clone());
+                }
+            }
+        }
+
+        if self.config.private_key.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "GitHub App private key is not configured; cannot mint JWT"
+            ));
+        }
+
         let now = Utc::now();
         let exp = now + ChronoDuration::minutes(10); // JWT expires in 10 minutes
         
@@ -113,20 +132,21 @@ impl GitHubClient {
         let token = encode(
             &Header::new(Algorithm::RS256),
             &payload,
-            &EncodingKey::from_rsa_pem(self.config.private_key.as_bytes())?
+            &EncodingKey::from_rsa_pem(self.config.private_key.as_bytes())
+                .context("Failed to parse RSA private key")?
         )?;
         
-        // Cache the JWT
-        self.jwt_cache.insert("jwt".to_string(), (token.clone(), Instant::now()));
-        
+        self.jwt_cache.lock().await.insert("jwt".to_string(), (token.clone(), Instant::now()));
         Ok(token)
     }
     
-    pub async fn get_installation_token(&mut self, installation_id: &str) -> Result<String> {
-        // Check cache first
-        if let Some((token, created_at)) = self.installation_token_cache.get(installation_id) {
-            if created_at.elapsed() < Duration::from_secs(3600) { // 1 hour cache
-                return Ok(token.clone());
+    pub async fn get_installation_token(&self, installation_id: &str) -> Result<String> {
+        {
+            let cache = self.installation_token_cache.lock().await;
+            if let Some((token, created_at)) = cache.get(installation_id) {
+                if created_at.elapsed() < Duration::from_secs(3300) {
+                    return Ok(token.clone());
+                }
             }
         }
         
@@ -151,8 +171,7 @@ impl GitHubClient {
         let token_response: InstallationTokenResponse = response.json().await
             .context("Failed to parse installation token response")?;
         
-        // Cache the token
-        self.installation_token_cache.insert(
+        self.installation_token_cache.lock().await.insert(
             installation_id.to_string(), 
             (token_response.token.clone(), Instant::now())
         );
@@ -161,7 +180,7 @@ impl GitHubClient {
     }
     
     pub async fn update_commit_status(
-        &mut self,
+        &self,
         repo: &str,
         sha: &str,
         status: BadgeStatus,
@@ -207,7 +226,7 @@ impl GitHubClient {
         Ok(())
     }
     
-    pub async fn get_pull_request(&mut self, repo: &str, pr_number: &str) -> Result<PullRequest> {
+    pub async fn get_pull_request(&self, repo: &str, pr_number: &str) -> Result<PullRequest> {
         let installation_id = &self.config.installation_id;
         let token = self.get_installation_token(installation_id).await?;
         
@@ -232,7 +251,7 @@ impl GitHubClient {
         Ok(pr)
     }
     
-    pub async fn get_repository(&mut self, repo: &str) -> Result<Repository> {
+    pub async fn get_repository(&self, repo: &str) -> Result<Repository> {
         let installation_id = &self.config.installation_id;
         let token = self.get_installation_token(installation_id).await?;
         
@@ -256,7 +275,33 @@ impl GitHubClient {
         Ok(repository)
     }
     
-    pub async fn get_commit(&mut self, repo: &str, sha: &str) -> Result<serde_json::Value> {
+    /// Resolve a numeric GitHub repository ID to its `owner/repo` full name
+    /// via `GET /repositories/{id}`.
+    pub async fn get_repository_full_name_by_id(&self, repository_id: &str) -> Result<String> {
+        let token = self.get_installation_token(&self.config.installation_id).await?;
+        let url = format!("{}/repositories/{}", self.config.base_url, repository_id);
+
+        let response = self.http_client
+            .get(&url)
+            .header(AUTHORIZATION, format!("token {}", token))
+            .send()
+            .await
+            .context("Failed to resolve repository by id")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!("Failed to resolve repository by id: {}", error_text));
+        }
+
+        let value: serde_json::Value = response.json().await
+            .context("Failed to parse repository response")?;
+        value.get("full_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("repository {} has no full_name", repository_id))
+    }
+
+    pub async fn get_commit(&self, repo: &str, sha: &str) -> Result<serde_json::Value> {
         let installation_id = &self.config.installation_id;
         let token = self.get_installation_token(installation_id).await?;
         
@@ -281,7 +326,7 @@ impl GitHubClient {
         Ok(commit)
     }
     
-    pub async fn get_changed_files(&mut self, repo: &str, pr_number: &str) -> Result<Vec<String>> {
+    pub async fn get_changed_files(&self, repo: &str, pr_number: &str) -> Result<Vec<String>> {
         let installation_id = &self.config.installation_id;
         let token = self.get_installation_token(installation_id).await?;
         
@@ -312,7 +357,7 @@ impl GitHubClient {
     }
     
     pub async fn create_check_run(
-        &mut self,
+        &self,
         repo: &str,
         name: &str,
         head_sha: &str,
@@ -358,7 +403,7 @@ impl GitHubClient {
     }
     
     pub async fn update_check_run(
-        &mut self,
+        &self,
         repo: &str,
         check_run_id: &str,
         status: &str,

@@ -1,43 +1,34 @@
+//! Spec-drift detection orchestration.
+//!
+//! The original scaffold depended on a fictional `temporal-sdk = "1.0"` crate.
+//! This module replaces it with a self-contained, dependency-light abstraction:
+//! activities are expressed as an [`async_trait`] ([`SpecDriftActivities`]) and
+//! the orchestration is a plain async [`SpecDriftEngine`]. This keeps the drift
+//! logic real and unit-testable with mock activities, while leaving a clean
+//! seam to plug in a durable workflow engine (Temporal, AWS Step Functions,
+//! etc.) later by implementing the activity trait against it.
+
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
-use serde::{Deserialize, Serialize};
-use temporal_sdk::{
-    WfContext, WorkflowResult, WorkflowError, ActivityOptions, 
-    workflow_interface, workflow_impl, activity_interface, activity_impl,
-};
-use temporal_sdk_core::protos::coresdk::workflow_commands::workflow_command::Variant;
-use temporal_sdk_core::protos::coresdk::workflow_commands::start_timer;
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::Result;
-use tracing::{info, warn, error};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tracing::info;
 
-// Activity interfaces for external operations
-#[activity_interface]
-pub trait SpecDriftActivities {
-    async fn fetch_spec_document(&self, document_id: String) -> Result<SpecDocument>;
-    async fn compute_document_hash(&self, document: SpecDocument) -> Result<String>;
-    async fn get_last_proven_hash(&self, document_id: String) -> Result<Option<String>>;
-    async fn enqueue_proof_job(&self, job: ProofJob) -> Result<String>;
-    async fn update_drift_status(&self, document_id: String, status: DriftStatus) -> Result<()>;
-    async fn send_drift_alert(&self, alert: DriftAlert) -> Result<()>;
-}
-
-// Workflow interfaces
-#[workflow_interface]
-pub trait SpecDriftWorkflow {
-    #[workflow_method(name = "spec-drift-detection")]
-    async fn detect_drift(&self, request: DriftDetectionRequest) -> WorkflowResult<DriftDetectionResponse>;
-    
-    #[signal_method(name = "spec-updated")]
-    async fn handle_spec_update(&self, update: SpecUpdateEvent);
-}
-
+// ---------------------------------------------------------------------------
 // Data structures
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecDocument {
     pub id: String,
     pub content: String,
     pub source_system: String,
-    pub last_modified: Instant,
+    pub last_modified: DateTime<Utc>,
     pub metadata: HashMap<String, String>,
 }
 
@@ -47,7 +38,7 @@ pub struct DriftDetectionRequest {
     pub source_system: String,
     pub event_type: String,
     pub event_id: String,
-    pub timestamp: Instant,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +56,7 @@ pub struct SpecUpdateEvent {
     pub document_id: String,
     pub source_system: String,
     pub event_id: String,
-    pub timestamp: Instant,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,13 +64,13 @@ pub struct ProofJob {
     pub id: String,
     pub document_id: String,
     pub priority: JobPriority,
-    pub created_at: Instant,
-    pub deadline: Option<Instant>,
+    pub created_at: DateTime<Utc>,
+    pub deadline: Option<DateTime<Utc>>,
     pub retry_count: u32,
     pub max_retries: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobPriority {
     Low = 0,
     Normal = 1,
@@ -87,7 +78,7 @@ pub enum JobPriority {
     Critical = 3,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DriftStatus {
     NoDrift,
     DriftDetected,
@@ -101,11 +92,11 @@ pub struct DriftAlert {
     pub document_id: String,
     pub alert_type: AlertType,
     pub message: String,
-    pub timestamp: Instant,
+    pub timestamp: DateTime<Utc>,
     pub severity: AlertSeverity,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AlertType {
     DriftDetected,
     ProofJobFailed,
@@ -113,7 +104,7 @@ pub enum AlertType {
     SystemError,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AlertSeverity {
     Info,
     Warning,
@@ -121,230 +112,287 @@ pub enum AlertSeverity {
     Critical,
 }
 
-// Workflow implementation
-#[workflow_impl]
-impl SpecDriftWorkflow for SpecDriftWorkflowImpl {
-    async fn detect_drift(&self, request: DriftDetectionRequest) -> WorkflowResult<DriftDetectionResponse> {
-        let start_time = Instant::now();
-        let ctx = self.ctx();
-        
+// ---------------------------------------------------------------------------
+// Activity boundary
+// ---------------------------------------------------------------------------
+
+/// External operations required by the drift-detection workflow. Implement this
+/// against real backends (ingest connectors, proof storage, job queue, alert
+/// transport). The default implementation ([`UnconfiguredActivities`]) fails
+/// loudly for operations that require external systems.
+#[async_trait]
+pub trait SpecDriftActivities: Send + Sync {
+    async fn fetch_spec_document(&self, document_id: &str) -> Result<SpecDocument>;
+    async fn get_last_proven_hash(&self, document_id: &str) -> Result<Option<String>>;
+    async fn enqueue_proof_job(&self, job: ProofJob) -> Result<String>;
+    async fn update_drift_status(&self, document_id: &str, status: DriftStatus) -> Result<()>;
+    async fn send_drift_alert(&self, alert: DriftAlert) -> Result<()>;
+
+    /// Compute the canonical SHA-256 content hash of a document. This is pure
+    /// and has a correct default implementation.
+    async fn compute_document_hash(&self, document: &SpecDocument) -> Result<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(document.content.as_bytes());
+        Ok(hex::encode(hasher.finalize()))
+    }
+}
+
+/// Default activities that fail loudly for anything requiring an external
+/// system. Used until real connectors/storage/queue/alerting are wired in.
+#[derive(Debug, Default, Clone)]
+pub struct UnconfiguredActivities;
+
+#[async_trait]
+impl SpecDriftActivities for UnconfiguredActivities {
+    async fn fetch_spec_document(&self, document_id: &str) -> Result<SpecDocument> {
+        Err(anyhow::anyhow!(
+            "fetch_spec_document is not configured: no ingest connector wired in (document '{}')",
+            document_id
+        ))
+    }
+
+    async fn get_last_proven_hash(&self, document_id: &str) -> Result<Option<String>> {
+        Err(anyhow::anyhow!(
+            "get_last_proven_hash is not configured: no proof-storage lookup wired in (document '{}')",
+            document_id
+        ))
+    }
+
+    async fn enqueue_proof_job(&self, job: ProofJob) -> Result<String> {
+        Err(anyhow::anyhow!(
+            "enqueue_proof_job is not configured: no job queue wired in (job {})",
+            job.id
+        ))
+    }
+
+    async fn update_drift_status(&self, document_id: &str, status: DriftStatus) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "update_drift_status is not configured: no persistence wired in (document '{}', status {:?})",
+            document_id, status
+        ))
+    }
+
+    async fn send_drift_alert(&self, alert: DriftAlert) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "send_drift_alert is not configured: no alert transport wired in (document '{}')",
+            alert.document_id
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration
+// ---------------------------------------------------------------------------
+
+/// Orchestrates drift detection over a set of [`SpecDriftActivities`].
+#[derive(Clone)]
+pub struct SpecDriftEngine {
+    activities: Arc<dyn SpecDriftActivities>,
+}
+
+impl SpecDriftEngine {
+    pub fn new(activities: Arc<dyn SpecDriftActivities>) -> Self {
+        Self { activities }
+    }
+
+    /// Detect whether a document has drifted from its last proven state and, if
+    /// so, enqueue a proof job and raise a drift alert.
+    pub async fn detect_drift(&self, request: DriftDetectionRequest) -> Result<DriftDetectionResponse> {
+        let start = std::time::Instant::now();
         info!("Starting drift detection for document: {}", request.document_id);
-        
-        // Create activity options with retry policy
-        let activity_opts = ActivityOptions {
-            start_to_close_timeout: Duration::from_secs(30),
-            retry_policy: Some(temporal_sdk::RetryPolicy {
-                initial_interval: Duration::from_secs(1),
-                maximum_interval: Duration::from_secs(60),
-                maximum_attempts: 3,
-                backoff_coefficient: 2.0,
-                non_retryable_error_types: vec!["ValidationError".to_string()],
-            }),
-            ..Default::default()
-        };
-        
-        // Fetch the current spec document
-        let document = ctx.activity::<SpecDriftActivities>()
-            .with_options(activity_opts.clone())
-            .fetch_spec_document(request.document_id.clone())
-            .await?;
-        
-        // Compute current hash
-        let current_hash = ctx.activity::<SpecDriftActivities>()
-            .with_options(activity_opts.clone())
-            .compute_document_hash(document.clone())
-            .await?;
-        
-        // Get last proven hash
-        let last_proven_hash = ctx.activity::<SpecDriftActivities>()
-            .with_options(activity_opts.clone())
-            .get_last_proven_hash(request.document_id.clone())
-            .await?;
-        
+
+        let document = self.activities.fetch_spec_document(&request.document_id).await?;
+        let current_hash = self.activities.compute_document_hash(&document).await?;
+        let last_proven_hash = self.activities.get_last_proven_hash(&request.document_id).await?;
+
         let drift_detected = match &last_proven_hash {
-            Some(proven_hash) => proven_hash != &current_hash,
-            None => true, // No previous proof exists
+            Some(proven) => proven != &current_hash,
+            None => true,
         };
-        
+
         let mut proof_job_id = None;
-        
         if drift_detected {
             info!("Drift detected for document: {}", request.document_id);
-            
-            // Update drift status
-            ctx.activity::<SpecDriftActivities>()
-                .with_options(activity_opts.clone())
-                .update_drift_status(request.document_id.clone(), DriftStatus::DriftDetected)
+            self.activities
+                .update_drift_status(&request.document_id, DriftStatus::DriftDetected)
                 .await?;
-            
-            // Create proof job
+
+            let now = Utc::now();
             let job = ProofJob {
                 id: uuid::Uuid::new_v4().to_string(),
                 document_id: request.document_id.clone(),
                 priority: JobPriority::High,
-                created_at: Instant::now(),
-                deadline: Some(Instant::now() + Duration::from_secs(3600)), // 1 hour
+                created_at: now,
+                deadline: Some(now + chrono::Duration::hours(1)),
                 retry_count: 0,
                 max_retries: 3,
             };
-            
-            proof_job_id = Some(ctx.activity::<SpecDriftActivities>()
-                .with_options(activity_opts.clone())
-                .enqueue_proof_job(job)
-                .await?);
-            
-            // Send alert for drift detection
-            let alert = DriftAlert {
-                document_id: request.document_id.clone(),
-                alert_type: AlertType::DriftDetected,
-                message: format!("Drift detected for document {}. New proof job created: {}", 
-                               request.document_id, proof_job_id.as_ref().unwrap()),
-                timestamp: Instant::now(),
-                severity: AlertSeverity::Warning,
-            };
-            
-            ctx.activity::<SpecDriftActivities>()
-                .with_options(activity_opts.clone())
-                .send_drift_alert(alert)
+            let job_id = self.activities.enqueue_proof_job(job).await?;
+
+            self.activities
+                .send_drift_alert(DriftAlert {
+                    document_id: request.document_id.clone(),
+                    alert_type: AlertType::DriftDetected,
+                    message: format!(
+                        "Drift detected for document {}. New proof job created: {}",
+                        request.document_id, job_id
+                    ),
+                    timestamp: Utc::now(),
+                    severity: AlertSeverity::Warning,
+                })
                 .await?;
+            proof_job_id = Some(job_id);
         }
-        
-        let processing_time = start_time.elapsed().as_millis() as u64;
-        
-        let response = DriftDetectionResponse {
+
+        Ok(DriftDetectionResponse {
             document_id: request.document_id,
             drift_detected,
             current_hash,
             last_proven_hash,
             proof_job_id,
-            processing_time_ms: processing_time,
-        };
-        
-        info!("Drift detection completed for document: {} (drift: {})", 
-              request.document_id, drift_detected);
-        
-        Ok(response)
-    }
-    
-    async fn handle_spec_update(&self, update: SpecUpdateEvent) {
-        let ctx = self.ctx();
-        
-        info!("Received spec update for document: {}", update.document_id);
-        
-        // Create drift detection request
-        let request = DriftDetectionRequest {
-            document_id: update.document_id,
-            source_system: update.source_system,
-            event_type: "spec_update".to_string(),
-            event_id: update.event_id,
-            timestamp: update.timestamp,
-        };
-        
-        // Start drift detection workflow
-        let _response = ctx.start_child_workflow::<SpecDriftWorkflow>()
-            .workflow_id(format!("drift-detection-{}", update.document_id))
-            .args(request)
-            .await;
+            processing_time_ms: start.elapsed().as_millis() as u64,
+        })
     }
 }
 
-// Activity implementations
-#[activity_impl]
-impl SpecDriftActivities for SpecDriftActivitiesImpl {
-    async fn fetch_spec_document(&self, document_id: String) -> Result<SpecDocument> {
-        // TODO: Implement actual document fetching from various sources
-        // This would integrate with the existing ingest connectors
-        todo!("Implement document fetching")
-    }
-    
-    async fn compute_document_hash(&self, document: SpecDocument) -> Result<String> {
-        use sha2::{Sha256, Digest};
-        
-        let mut hasher = Sha256::new();
-        hasher.update(document.content.as_bytes());
-        let result = hasher.finalize();
-        
-        Ok(hex::encode(result))
-    }
-    
-    async fn get_last_proven_hash(&self, document_id: String) -> Result<Option<String>> {
-        // TODO: Implement hash retrieval from proof storage
-        todo!("Implement hash retrieval")
-    }
-    
-    async fn enqueue_proof_job(&self, job: ProofJob) -> Result<String> {
-        // TODO: Implement job queuing to lean-farm
-        todo!("Implement job queuing")
-    }
-    
-    async fn update_drift_status(&self, document_id: String, status: DriftStatus) -> Result<()> {
-        // TODO: Implement status update in database
-        todo!("Implement status update")
-    }
-    
-    async fn send_drift_alert(&self, alert: DriftAlert) -> Result<()> {
-        // TODO: Implement alert sending (email, Slack, etc.)
-        todo!("Implement alert sending")
-    }
-}
+// ---------------------------------------------------------------------------
+// Load / chaos testing utilities
+// ---------------------------------------------------------------------------
 
-// Chaos testing utilities
 pub struct ChaosTestUtils;
 
 impl ChaosTestUtils {
-    pub async fn simulate_burst_edits(count: u32) -> Result<Vec<DriftDetectionRequest>> {
-        let mut requests = Vec::new();
-        
-        for i in 0..count {
-            let request = DriftDetectionRequest {
+    pub fn simulate_burst_edits(count: u32) -> Vec<DriftDetectionRequest> {
+        (0..count)
+            .map(|i| DriftDetectionRequest {
                 document_id: format!("doc-{}", i),
                 source_system: "jira".to_string(),
                 event_type: "edit".to_string(),
                 event_id: uuid::Uuid::new_v4().to_string(),
-                timestamp: Instant::now(),
-            };
-            requests.push(request);
-        }
-        
-        Ok(requests)
+                timestamp: Utc::now(),
+            })
+            .collect()
     }
-    
-    pub async fn validate_processing_time(requests: &[DriftDetectionRequest], max_time: Duration) -> bool {
-        let start_time = Instant::now();
-        
-        // TODO: Implement actual processing validation
-        // This would track the actual processing time of all requests
-        
-        let total_time = start_time.elapsed();
-        total_time <= max_time
+
+    /// Run drift detection for each request through `engine` and report whether
+    /// the whole batch completed within `max_time`. Individual activity errors
+    /// are tolerated (counted) so that unconfigured backends do not abort the
+    /// timing measurement.
+    pub async fn measure_processing_time(
+        engine: &SpecDriftEngine,
+        requests: &[DriftDetectionRequest],
+        max_time: Duration,
+    ) -> (Duration, bool) {
+        let start = std::time::Instant::now();
+        for request in requests {
+            let _ = engine.detect_drift(request.clone()).await;
+        }
+        let elapsed = start.elapsed();
+        (elapsed, elapsed <= max_time)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    #[tokio::test]
-    async fn test_drift_detection_workflow() {
-        let request = DriftDetectionRequest {
-            document_id: "test-doc-1".to_string(),
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockActivities {
+        last_hash: Option<String>,
+        enqueued: Mutex<Vec<String>>,
+        alerts: Mutex<Vec<DriftAlert>>,
+    }
+
+    #[async_trait]
+    impl SpecDriftActivities for MockActivities {
+        async fn fetch_spec_document(&self, document_id: &str) -> Result<SpecDocument> {
+            Ok(SpecDocument {
+                id: document_id.to_string(),
+                content: "spec body".to_string(),
+                source_system: "jira".to_string(),
+                last_modified: Utc::now(),
+                metadata: HashMap::new(),
+            })
+        }
+        async fn get_last_proven_hash(&self, _document_id: &str) -> Result<Option<String>> {
+            Ok(self.last_hash.clone())
+        }
+        async fn enqueue_proof_job(&self, job: ProofJob) -> Result<String> {
+            self.enqueued.lock().unwrap().push(job.document_id.clone());
+            Ok(job.id)
+        }
+        async fn update_drift_status(&self, _document_id: &str, _status: DriftStatus) -> Result<()> {
+            Ok(())
+        }
+        async fn send_drift_alert(&self, alert: DriftAlert) -> Result<()> {
+            self.alerts.lock().unwrap().push(alert);
+            Ok(())
+        }
+    }
+
+    fn request(doc: &str) -> DriftDetectionRequest {
+        DriftDetectionRequest {
+            document_id: doc.to_string(),
             source_system: "jira".to_string(),
             event_type: "edit".to_string(),
-            event_id: "test-event-1".to_string(),
-            timestamp: Instant::now(),
-        };
-        
-        // TODO: Implement actual workflow testing
-        // This would require setting up a Temporal test environment
+            event_id: "e1".to_string(),
+            timestamp: Utc::now(),
+        }
     }
-    
+
     #[tokio::test]
-    async fn test_chaos_burst_edits() {
-        let requests = ChaosTestUtils::simulate_burst_edits(1000).await.unwrap();
-        assert_eq!(requests.len(), 1000);
-        
-        let max_time = Duration::from_secs(300); // 5 minutes
-        let processed_in_time = ChaosTestUtils::validate_processing_time(&requests, max_time).await;
-        assert!(processed_in_time);
+    async fn test_compute_document_hash_is_sha256() {
+        let acts = UnconfiguredActivities;
+        let doc = SpecDocument {
+            id: "d".to_string(),
+            content: "abc".to_string(),
+            source_system: "s".to_string(),
+            last_modified: Utc::now(),
+            metadata: HashMap::new(),
+        };
+        let hash = acts.compute_document_hash(&doc).await.unwrap();
+        // SHA-256("abc")
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
-} 
+
+    #[tokio::test]
+    async fn test_detect_drift_when_no_prior_hash() {
+        let engine = SpecDriftEngine::new(Arc::new(MockActivities::default()));
+        let resp = engine.detect_drift(request("doc-1")).await.unwrap();
+        assert!(resp.drift_detected);
+        assert!(resp.proof_job_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_no_drift_when_hash_matches() {
+        // SHA-256("spec body")
+        let matching = {
+            let mut h = Sha256::new();
+            h.update(b"spec body");
+            hex::encode(h.finalize())
+        };
+        let engine = SpecDriftEngine::new(Arc::new(MockActivities {
+            last_hash: Some(matching),
+            ..Default::default()
+        }));
+        let resp = engine.detect_drift(request("doc-1")).await.unwrap();
+        assert!(!resp.drift_detected);
+        assert!(resp.proof_job_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unconfigured_activities_fail_loudly() {
+        let engine = SpecDriftEngine::new(Arc::new(UnconfiguredActivities));
+        assert!(engine.detect_drift(request("doc-1")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_simulate_burst_edits() {
+        let requests = ChaosTestUtils::simulate_burst_edits(1000);
+        assert_eq!(requests.len(), 1000);
+    }
+}

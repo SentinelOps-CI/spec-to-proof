@@ -10,6 +10,14 @@ pub mod server;
 pub mod workflows;
 pub mod webhook_handlers;
 
+// Optional AWS cost-governance integrations (Cost Explorer, SES, EventBridge,
+// ECS, Lambda). Gated behind the `aws-governance` feature so the default build
+// does not pull in the heavyweight AWS SDK crates.
+#[cfg(feature = "aws-governance")]
+pub mod cost_governance;
+#[cfg(feature = "aws-governance")]
+pub mod cloudwatch_events;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -20,19 +28,18 @@ use axum::{
     Json,
     extract::{State, Path},
 };
-use serde::{Deserialize, Serialize};
-use tracing::{info, error, warn};
+use tracing::info;
 use anyhow::Result;
 
 use crate::config::GitHubAppConfig;
 use crate::github::GitHubClient;
 use crate::webhook::WebhookProcessor;
-use crate::badge::BadgeManager;
+use crate::badge::{BadgeManager, DirectoryProofArtifactSource};
 use crate::sigstore::SigstoreClient;
 use crate::auth::JWTManager;
 use crate::proto::gh_app::v1::*;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     pub config: GitHubAppConfig,
     pub github_client: Arc<GitHubClient>,
@@ -41,13 +48,23 @@ pub struct AppState {
     pub sigstore_client: Arc<SigstoreClient>,
     pub jwt_manager: Arc<JWTManager>,
     pub metrics: Arc<RwLock<HashMap<String, u64>>>,
+    /// Process start time, used to report real uptime on the health endpoint.
+    pub start_time: std::time::Instant,
 }
 
 impl AppState {
     pub async fn new(config: GitHubAppConfig) -> Result<Self> {
         let github_client = Arc::new(GitHubClient::new(&config).await?);
         let webhook_processor = Arc::new(WebhookProcessor::new(&config).await?);
-        let badge_manager = Arc::new(BadgeManager::new(&config).await?);
+        // When a proof-artifact reference directory is configured, back the
+        // badge service with the real farm-produced artifacts read from it.
+        let mut badge_manager = BadgeManager::new(&config).await?;
+        if let Some(dir) = &config.proof_reference_dir {
+            info!("Badge service backed by proof reference directory {}", dir);
+            badge_manager =
+                badge_manager.with_proof_source(Arc::new(DirectoryProofArtifactSource::new(dir)));
+        }
+        let badge_manager = Arc::new(badge_manager);
         let sigstore_client = Arc::new(SigstoreClient::new(&config).await?);
         let jwt_manager = Arc::new(JWTManager::new(&config).await?);
         let metrics = Arc::new(RwLock::new(HashMap::new()));
@@ -60,8 +77,31 @@ impl AppState {
             sigstore_client,
             jwt_manager,
             metrics,
+            start_time: std::time::Instant::now(),
         })
     }
+}
+
+/// Format a duration as a compact, human-readable uptime string (e.g. `1d2h3m4s`).
+pub fn format_uptime(elapsed: std::time::Duration) -> String {
+    let total_secs = elapsed.as_secs();
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
+    let seconds = total_secs % 60;
+
+    let mut out = String::new();
+    if days > 0 {
+        out.push_str(&format!("{}d", days));
+    }
+    if days > 0 || hours > 0 {
+        out.push_str(&format!("{}h", hours));
+    }
+    if days > 0 || hours > 0 || minutes > 0 {
+        out.push_str(&format!("{}m", minutes));
+    }
+    out.push_str(&format!("{}s", seconds));
+    out
 }
 
 pub async fn create_app(state: AppState) -> Router {
@@ -154,13 +194,24 @@ async fn update_badge(
 async fn health_check(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<HealthCheckResponse>, (StatusCode, String)> {
-    let checks = HashMap::new(); // TODO: Implement actual health checks
+    let mut checks: HashMap<String, String> = HashMap::new();
+
+    // The JWT manager health check exercises the real GitHub App auth path
+    // (loading the configured RSA key and minting an app JWT), so it is a
+    // meaningful readiness signal rather than a hardcoded "ok".
+    let jwt_healthy = state.jwt_manager.health_check().await.unwrap_or(false);
+    checks.insert(
+        "github_app_auth".to_string(),
+        if jwt_healthy { "ok".to_string() } else { "degraded".to_string() },
+    );
+
+    let status = if jwt_healthy { "healthy" } else { "degraded" };
 
     let response = HealthCheckResponse {
-        status: "healthy".to_string(),
+        status: status.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        uptime: "0s".to_string(), // TODO: Track actual uptime
-        checks: checks.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
+        uptime: format_uptime(state.start_time.elapsed()),
+        checks,
     };
 
     Ok(Json(response))

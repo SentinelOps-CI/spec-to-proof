@@ -29,13 +29,13 @@ pub mod gh_app {
             Merged = 5,
         }
         
-        #[derive(Debug, Clone, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
         pub enum BadgeStatus {
-            Unspecified = 0,
-            Pending = 1,
-            Success = 2,
-            Failure = 3,
-            Error = 4,
+            BadgeStatusUnspecified = 0,
+            BadgeStatusPending = 1,
+            BadgeStatusSuccess = 2,
+            BadgeStatusFailure = 3,
+            BadgeStatusError = 4,
         }
         
         #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,8 +158,8 @@ pub mod gh_app {
             pub context: String,
             pub proof_artifacts: Vec<ProofArtifactReference>,
             pub sigstore_entries: Vec<SigstoreEntry>,
-            pub created_at: DateTime<Utc>,
-            pub updated_at: DateTime<Utc>,
+            pub created_at: Option<DateTime<Utc>>,
+            pub updated_at: Option<DateTime<Utc>>,
         }
         
         #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,7 +170,7 @@ pub mod gh_app {
             pub proof_hash: String,
             pub rekor_entry_id: String,
             pub fulcio_certificate: String,
-            pub proven_at: DateTime<Utc>,
+            pub proven_at: Option<DateTime<Utc>>,
             pub status: String,
             pub error_message: String,
         }

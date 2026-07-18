@@ -1,13 +1,11 @@
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::signal;
 use tracing::{info, warn, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use clap::Parser;
 use anyhow::Result;
 
-use crate::config::GitHubAppConfig;
-use crate::server::Server;
+use gh_app::config::GitHubAppConfig;
+use gh_app::server::Server;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -59,20 +57,8 @@ async fn main() -> Result<()> {
     let server = Server::new(config).await?;
     info!("Server created successfully");
     
-    // Set up graceful shutdown
-    let shutdown_signal = async {
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                info!("Received Ctrl+C, initiating shutdown");
-            }
-            _ = signal::unix::signal(signal::unix::SignalKind::terminate()) => {
-                info!("Received SIGTERM, initiating shutdown");
-            }
-            _ = signal::unix::signal(signal::unix::SignalKind::interrupt()) => {
-                info!("Received SIGINT, initiating shutdown");
-            }
-        }
-    };
+    // Set up graceful shutdown (cross-platform: Ctrl+C everywhere, SIGTERM on Unix).
+    let shutdown_signal = shutdown_signal();
     
     // Run server with graceful shutdown
     let server_handle = tokio::spawn(async move {
@@ -101,10 +87,40 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Wait for a shutdown signal. Listens for Ctrl+C on all platforms and, on
+/// Unix, also for SIGTERM (as used by container orchestrators).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = signal::ctrl_c().await {
+            error!("Failed to install Ctrl+C handler: {}", e);
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => error!("Failed to install SIGTERM handler: {}", e),
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("Received Ctrl+C, initiating shutdown"),
+        _ = terminate => info!("Received SIGTERM, initiating shutdown"),
+    }
+}
+
 fn init_logging(level: &str, format: &str, debug: bool) -> Result<()> {
-    let log_level = level.parse::<tracing::Level>()
-        .unwrap_or(tracing::Level::INFO);
-    
+    // Validate the requested level early so a bad value surfaces at startup.
+    level
+        .parse::<tracing::Level>()
+        .map_err(|e| anyhow::anyhow!("invalid log level '{}': {}", level, e))?;
+
     let subscriber = tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -137,42 +153,11 @@ fn init_logging(level: &str, format: &str, debug: bool) -> Result<()> {
     Ok(())
 }
 
+/// Load and validate configuration from a YAML file (if present), overlaid
+/// with `GH_APP_*` environment variables and optional AWS Secrets Manager.
 async fn load_config(config_path: &str) -> Result<GitHubAppConfig> {
-    // For now, create a default config
-    // TODO: Implement actual config loading from file
-    let mut config = GitHubAppConfig::default();
-    
-    // Override with environment variables if present
-    if let Ok(app_id) = std::env::var("GH_APP_ID") {
-        config.app_id = app_id;
-    }
-    
-    if let Ok(private_key) = std::env::var("GH_APP_PRIVATE_KEY") {
-        config.private_key = private_key;
-    }
-    
-    if let Ok(webhook_secret) = std::env::var("GH_APP_WEBHOOK_SECRET") {
-        config.webhook_secret = webhook_secret;
-    }
-    
-    if let Ok(installation_id) = std::env::var("GH_APP_INSTALLATION_ID") {
-        config.installation_id = installation_id;
-    }
-    
-    if let Ok(host) = std::env::var("GH_APP_HOST") {
-        config.host = host;
-    }
-    
-    if let Ok(port) = std::env::var("GH_APP_PORT") {
-        if let Ok(port_num) = port.parse::<u16>() {
-            config.port = port_num;
-        }
-    }
-    
-    // Validate configuration
-    config.validate()?;
-    
-    info!("Configuration loaded from environment variables");
+    let config = GitHubAppConfig::load_from(config_path).await?;
+    info!("Configuration loaded from {} (+ environment overrides)", config_path);
     Ok(config)
 }
 
@@ -182,7 +167,7 @@ mod tests {
     
     #[test]
     fn test_args_parsing() {
-        let args = Args::parse_from(&["gh-app", "--config", "test.yaml"]);
+        let args = Args::parse_from(["gh-app", "--config", "test.yaml"]);
         assert_eq!(args.config, "test.yaml");
         assert_eq!(args.log_level, "info");
         assert_eq!(args.log_format, "json");
