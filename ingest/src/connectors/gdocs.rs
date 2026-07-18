@@ -9,38 +9,42 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDriveFile {
     pub id: String,
     pub name: String,
-    pub mimeType: String,
-    pub createdTime: String,
-    pub modifiedTime: String,
+    pub mime_type: String,
+    pub created_time: String,
+    pub modified_time: String,
     pub owners: Vec<GoogleDriveUser>,
-    pub lastModifyingUser: Option<GoogleDriveUser>,
+    pub last_modifying_user: Option<GoogleDriveUser>,
     pub parents: Vec<String>,
-    pub webViewLink: String,
+    pub web_view_link: String,
     pub size: Option<String>,
     pub description: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDriveUser {
-    pub displayName: String,
-    pub emailAddress: String,
+    pub display_name: String,
+    pub email_address: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDriveFileList {
     pub files: Vec<GoogleDriveFile>,
-    pub nextPageToken: Option<String>,
+    pub next_page_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDocsDocument {
-    pub documentId: String,
+    pub document_id: String,
     pub title: String,
     pub body: GoogleDocsBody,
-    pub revisionId: String,
+    pub revision_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,31 +53,35 @@ pub struct GoogleDocsBody {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDocsContent {
-    pub startIndex: Option<i32>,
-    pub endIndex: Option<i32>,
+    pub start_index: Option<i32>,
+    pub end_index: Option<i32>,
     pub paragraph: Option<GoogleDocsParagraph>,
     pub table: Option<GoogleDocsTable>,
-    pub sectionBreak: Option<GoogleDocsSectionBreak>,
+    pub section_break: Option<GoogleDocsSectionBreak>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDocsParagraph {
     pub elements: Vec<GoogleDocsElement>,
-    pub paragraphStyle: Option<GoogleDocsParagraphStyle>,
+    pub paragraph_style: Option<GoogleDocsParagraphStyle>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDocsElement {
-    pub startIndex: Option<i32>,
-    pub endIndex: Option<i32>,
-    pub textRun: Option<GoogleDocsTextRun>,
+    pub start_index: Option<i32>,
+    pub end_index: Option<i32>,
+    pub text_run: Option<GoogleDocsTextRun>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDocsTextRun {
     pub content: String,
-    pub textStyle: Option<GoogleDocsTextStyle>,
+    pub text_style: Option<GoogleDocsTextStyle>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,18 +92,21 @@ pub struct GoogleDocsTextStyle {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDocsParagraphStyle {
-    pub namedStyleType: Option<String>,
+    pub named_style_type: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDocsTable {
-    pub tableRows: Vec<GoogleDocsTableRow>,
+    pub table_rows: Vec<GoogleDocsTableRow>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDocsTableRow {
-    pub tableCells: Vec<GoogleDocsTableCell>,
+    pub table_cells: Vec<GoogleDocsTableCell>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -104,21 +115,29 @@ pub struct GoogleDocsTableCell {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDocsSectionBreak {
-    pub sectionStyle: Option<GoogleDocsSectionStyle>,
+    pub section_style: Option<GoogleDocsSectionStyle>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoogleDocsSectionStyle {
-    pub columnSeparatorStyle: Option<String>,
+    pub column_separator_style: Option<String>,
 }
+
+/// Default Google Drive API root (`.../drive/v3/files` is appended).
+const DEFAULT_DRIVE_API_BASE: &str = "https://www.googleapis.com";
+/// Default Google Docs API root (`.../v1/documents/{id}` is appended).
+const DEFAULT_DOCS_API_BASE: &str = "https://docs.googleapis.com";
 
 pub struct GoogleDocsConnector {
     config: ConnectorConfig,
     http_client: Client,
     rate_limiter: RateLimiter,
     backoff: ExponentialBackoff,
-    last_sync_timestamp: Option<i64>,
+    drive_api_base: String,
+    docs_api_base: String,
 }
 
 impl GoogleDocsConnector {
@@ -138,8 +157,22 @@ impl GoogleDocsConnector {
             http_client,
             rate_limiter,
             backoff: ExponentialBackoff::new(),
-            last_sync_timestamp: None,
+            drive_api_base: DEFAULT_DRIVE_API_BASE.to_string(),
+            docs_api_base: DEFAULT_DOCS_API_BASE.to_string(),
         }
+    }
+
+    /// Override the Drive and Docs API roots. Enables pointing the connector at
+    /// a mock server for integration testing without changing production
+    /// behaviour (which uses Google's real endpoints).
+    pub fn with_endpoints(
+        mut self,
+        drive_api_base: impl Into<String>,
+        docs_api_base: impl Into<String>,
+    ) -> Self {
+        self.drive_api_base = drive_api_base.into();
+        self.docs_api_base = docs_api_base.into();
+        self
     }
 
     pub async fn poll_documents(&mut self, token: &OAuth2Token) -> Result<Vec<SpecDocument>, Box<dyn std::error::Error>> {
@@ -147,7 +180,8 @@ impl GoogleDocsConnector {
 
         // First, search for Google Docs files
         let files = self.search_docs_files(token).await?;
-        
+        let file_count = files.len();
+
         let mut documents = Vec::new();
         for file in files {
             if let Some(document) = self.convert_file_to_document(file, token).await? {
@@ -157,58 +191,68 @@ impl GoogleDocsConnector {
 
         tracing::info!(
             "Polled {} Google Docs files, converted {} to documents",
-            files.len(),
+            file_count,
             documents.len()
         );
 
         Ok(documents)
     }
 
-    async fn search_docs_files(&mut self, token: &OAuth2Token) -> Result<Vec<GoogleDriveFile>, Box<dyn std::error::Error>> {
-        let url = "https://www.googleapis.com/drive/v3/files";
-        
+    async fn search_docs_files(&self, token: &OAuth2Token) -> Result<Vec<GoogleDriveFile>, Box<dyn std::error::Error>> {
+        let url = format!("{}/drive/v3/files", self.drive_api_base);
+        let url = url.as_str();
+
+        // Combine the document-type filter and the specification search terms
+        // into a single Drive `q` expression (a request must carry only one
+        // `q` parameter).
+        let query = "mimeType='application/vnd.google-apps.document' AND \
+             (name contains 'specification' OR name contains 'spec' OR \
+             fullText contains 'specification' OR fullText contains 'spec')";
+        let fields = "nextPageToken,files(id,name,mimeType,createdTime,modifiedTime,owners,lastModifyingUser,parents,webViewLink,size,description)";
+        let page_size = self.config.batch_size.to_string();
+        let http_client = &self.http_client;
+
         let mut all_files = Vec::new();
-        let mut page_token = None;
+        let mut page_token: Option<String> = None;
 
         loop {
-            let response = self.backoff
-                .execute_with_backoff(|| async {
-                    let mut query_params = vec![
-                        ("q", "mimeType='application/vnd.google-apps.document'"),
-                        ("fields", "files(id,name,mimeType,createdTime,modifiedTime,owners,lastModifyingUser,parents,webViewLink,size,description)"),
-                        ("pageSize", &self.config.batch_size.to_string()),
-                    ];
-
-                    if let Some(token) = &page_token {
-                        query_params.push(("pageToken", token));
-                    }
-
-                    // Add search terms for specification-related documents
-                    let search_query = "(name contains 'specification' OR name contains 'spec' OR description contains 'specification' OR description contains 'spec')";
-                    query_params.push(("q", &format!("mimeType='application/vnd.google-apps.document' AND ({})", search_query)));
-
-                    let response = self.http_client
+            let page_token_ref = page_token.clone();
+            let file_list: GoogleDriveFileList = self.backoff
+                .execute_with_backoff_async(|| async {
+                    let mut request = http_client
                         .get(url)
                         .header("Authorization", format!("Bearer {}", token.access_token))
-                        .query(&query_params)
+                        .query(&[
+                            ("q", query),
+                            ("fields", fields),
+                            ("pageSize", page_size.as_str()),
+                        ]);
+
+                    if let Some(pt) = page_token_ref.as_deref() {
+                        request = request.query(&[("pageToken", pt)]);
+                    }
+
+                    let response = request
                         .send()
-                        .await?;
+                        .await
+                        .map_err(|e| format!("Google Drive request failed: {}", e))?;
 
                     if !response.status().is_success() {
                         return Err(format!("Google Drive API error: {}", response.status()));
                     }
 
-                    let file_list: GoogleDriveFileList = response.json().await?;
-                    Ok(file_list)
+                    response
+                        .json::<GoogleDriveFileList>()
+                        .await
+                        .map_err(|e| format!("Failed to parse Google Drive response: {}", e))
                 })
                 .await?;
 
-            all_files.extend(response.files);
+            all_files.extend(file_list.files);
 
-            if let Some(next_token) = response.nextPageToken {
-                page_token = Some(next_token);
-            } else {
-                break;
+            match file_list.next_page_token {
+                Some(next_token) => page_token = Some(next_token),
+                None => break,
             }
         }
 
@@ -225,18 +269,24 @@ impl GoogleDocsConnector {
         let content = self.fetch_document_content(&file.id, token).await?;
         let content_sha256 = self.compute_content_hash(&content);
 
+        // Extract metadata (which borrows `file`) before consuming its fields.
+        let extra_metadata = self.extract_metadata(&file);
+        let created_at = self.parse_timestamp(&file.created_time)?;
+        let modified_at = self.parse_timestamp(&file.modified_time)?;
+        let author = file.owners.first()
+            .map(|owner| owner.display_name.clone())
+            .unwrap_or_else(|| "Unknown".to_string());
+
         let metadata = DocumentMetadata {
             source_id: file.id,
             title: file.name,
-            url: file.webViewLink,
-            author: file.owners.first()
-                .map(|owner| owner.displayName.clone())
-                .unwrap_or_else(|| "Unknown".to_string()),
-            created_at: self.parse_timestamp(&file.createdTime)?,
-            modified_at: self.parse_timestamp(&file.modifiedTime)?,
+            url: file.web_view_link,
+            author,
+            created_at,
+            modified_at,
             version: 1, // Google Docs doesn't expose version numbers
             status: "published".to_string(),
-            metadata: self.extract_metadata(&file),
+            metadata: extra_metadata,
         };
 
         let mut document: SpecDocument = metadata.into();
@@ -248,26 +298,30 @@ impl GoogleDocsConnector {
     }
 
     async fn fetch_document_content(&self, document_id: &str, token: &OAuth2Token) -> Result<String, Box<dyn std::error::Error>> {
-        let url = format!("https://docs.googleapis.com/v1/documents/{}", document_id);
+        let url = format!("{}/v1/documents/{}", self.docs_api_base, document_id);
 
-        let response = self.backoff
-            .execute_with_backoff(|| async {
-                let response = self.http_client
+        let http_client = &self.http_client;
+        let doc: GoogleDocsDocument = self.backoff
+            .execute_with_backoff_async(|| async {
+                let response = http_client
                     .get(&url)
                     .header("Authorization", format!("Bearer {}", token.access_token))
                     .send()
-                    .await?;
+                    .await
+                    .map_err(|e| format!("Google Docs request failed: {}", e))?;
 
                 if !response.status().is_success() {
                     return Err(format!("Google Docs API error: {}", response.status()));
                 }
 
-                let doc: GoogleDocsDocument = response.json().await?;
-                Ok(doc)
+                response
+                    .json::<GoogleDocsDocument>()
+                    .await
+                    .map_err(|e| format!("Failed to parse Google Docs response: {}", e))
             })
             .await?;
 
-        self.extract_content_from_document(&response)
+        self.extract_content_from_document(&doc)
     }
 
     fn extract_content_from_document(&self, doc: &GoogleDocsDocument) -> Result<String, Box<dyn std::error::Error>> {
@@ -303,8 +357,8 @@ impl GoogleDocsConnector {
         let mut content = String::new();
 
         // Check if this is a heading
-        if let Some(style) = &paragraph.paragraphStyle {
-            if let Some(named_style) = &style.namedStyleType {
+        if let Some(style) = &paragraph.paragraph_style {
+            if let Some(named_style) = &style.named_style_type {
                 match named_style.as_str() {
                     "HEADING_1" => content.push_str("# "),
                     "HEADING_2" => content.push_str("## "),
@@ -316,11 +370,11 @@ impl GoogleDocsConnector {
 
         // Extract text from elements
         for element in &paragraph.elements {
-            if let Some(text_run) = &element.textRun {
+            if let Some(text_run) = &element.text_run {
                 let mut text = text_run.content.clone();
 
                 // Apply text styling
-                if let Some(text_style) = &text_run.textStyle {
+                if let Some(text_style) = &text_run.text_style {
                     if text_style.bold.unwrap_or(false) {
                         text = format!("**{}**", text);
                     }
@@ -339,10 +393,10 @@ impl GoogleDocsConnector {
     fn extract_table_content(&self, table: &GoogleDocsTable) -> String {
         let mut content = String::new();
 
-        for row in &table.tableRows {
+        for row in &table.table_rows {
             let mut row_content = String::new();
             
-            for cell in &row.tableCells {
+            for cell in &row.table_cells {
                 let cell_text = self.extract_cell_content(cell);
                 row_content.push_str(&format!("| {}", cell_text));
             }
@@ -370,7 +424,7 @@ impl GoogleDocsConnector {
     fn extract_metadata(&self, file: &GoogleDriveFile) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
         
-        metadata.insert("mime_type".to_string(), file.mimeType.clone());
+        metadata.insert("mime_type".to_string(), file.mime_type.clone());
         metadata.insert("size".to_string(), file.size.clone().unwrap_or_default());
         
         if let Some(description) = &file.description {
@@ -379,14 +433,14 @@ impl GoogleDocsConnector {
 
         // Add owner information
         if let Some(owner) = file.owners.first() {
-            metadata.insert("owner_email".to_string(), owner.emailAddress.clone());
-            metadata.insert("owner_display_name".to_string(), owner.displayName.clone());
+            metadata.insert("owner_email".to_string(), owner.email_address.clone());
+            metadata.insert("owner_display_name".to_string(), owner.display_name.clone());
         }
 
         // Add last modifying user information
-        if let Some(last_modifier) = &file.lastModifyingUser {
-            metadata.insert("last_modifier_email".to_string(), last_modifier.emailAddress.clone());
-            metadata.insert("last_modifier_display_name".to_string(), last_modifier.displayName.clone());
+        if let Some(last_modifier) = &file.last_modifying_user {
+            metadata.insert("last_modifier_email".to_string(), last_modifier.email_address.clone());
+            metadata.insert("last_modifier_display_name".to_string(), last_modifier.display_name.clone());
         }
 
         // Add parent folder information
@@ -410,11 +464,13 @@ impl GoogleDocsConnector {
         Ok(timestamp.with_timezone(&Utc))
     }
 
+    #[allow(dead_code)]
     fn parse_google_timestamp(&self, timestamp_str: &str) -> Result<i64, Box<dyn std::error::Error>> {
         let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp_str)?;
         Ok(timestamp.timestamp())
     }
 
+    #[allow(dead_code)]
     fn format_google_timestamp(&self, timestamp: i64) -> String {
         let dt = chrono::DateTime::from_timestamp(timestamp, 0)
             .unwrap_or_else(|| chrono::Utc::now());
@@ -457,9 +513,9 @@ mod tests {
 
         let connector = GoogleDocsConnector::new(config);
         let timestamp = connector.parse_timestamp("2023-01-01T12:00:00.000Z").unwrap();
-        
-        assert!(timestamp.seconds > 0);
-        assert!(timestamp.nanos >= 0);
+
+        assert!(timestamp.timestamp() > 0);
+        assert_eq!(timestamp.date_naive().to_string(), "2023-01-01");
     }
 
     #[test]
@@ -478,11 +534,11 @@ mod tests {
         let paragraph = GoogleDocsParagraph {
             elements: vec![
                 GoogleDocsElement {
-                    startIndex: Some(0),
-                    endIndex: Some(4),
-                    textRun: Some(GoogleDocsTextRun {
+                    start_index: Some(0),
+                    end_index: Some(4),
+                    text_run: Some(GoogleDocsTextRun {
                         content: "Test".to_string(),
-                        textStyle: Some(GoogleDocsTextStyle {
+                        text_style: Some(GoogleDocsTextStyle {
                             bold: Some(true),
                             italic: Some(false),
                             underline: Some(false),
@@ -490,7 +546,7 @@ mod tests {
                     }),
                 },
             ],
-            paragraphStyle: None,
+            paragraph_style: None,
         };
 
         let content = connector.extract_paragraph_content(&paragraph);

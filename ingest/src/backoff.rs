@@ -89,6 +89,48 @@ impl ExponentialBackoff {
 
         Err(last_error.unwrap())
     }
+
+    /// Retry an asynchronous, fallible operation with exponential backoff.
+    ///
+    /// `operation` is a closure returning a future each time it is invoked, so
+    /// each attempt performs a fresh call (e.g. a new HTTP request). Retries
+    /// stop as soon as the operation succeeds or the attempt budget is
+    /// exhausted, in which case the last error is returned.
+    pub async fn execute_with_backoff_async<F, Fut, T, E>(
+        &self,
+        mut operation: F,
+    ) -> Result<T, E>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+        E: std::fmt::Display,
+    {
+        let mut last_error = None;
+
+        for attempt in 0..self.max_attempts {
+            match operation().await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    last_error = Some(e);
+
+                    if attempt < self.max_attempts - 1 {
+                        let delay = self.calculate_delay(attempt);
+                        tracing::warn!(
+                            "Async operation failed (attempt {}/{}): {}. Retrying in {:?}",
+                            attempt + 1,
+                            self.max_attempts,
+                            last_error.as_ref().unwrap(),
+                            delay
+                        );
+
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap())
+    }
 }
 
 impl Default for ExponentialBackoff {
@@ -146,5 +188,45 @@ mod tests {
         
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().to_string(), "Always fails");
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_backoff_async_retries_then_succeeds() {
+        // Use a tight schedule so the test stays fast.
+        let backoff = ExponentialBackoff::new()
+            .with_base_delay(Duration::from_millis(1))
+            .with_max_delay(Duration::from_millis(2))
+            .with_max_attempts(5);
+        let counter = AtomicU32::new(0);
+
+        let result: Result<&str, &str> = backoff
+            .execute_with_backoff_async(|| {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt < 2 {
+                        Err("transient")
+                    } else {
+                        Ok("ok")
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(result, Ok("ok"));
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_backoff_async_gives_up() {
+        let backoff = ExponentialBackoff::new()
+            .with_base_delay(Duration::from_millis(1))
+            .with_max_delay(Duration::from_millis(2))
+            .with_max_attempts(3);
+
+        let result: Result<(), &str> = backoff
+            .execute_with_backoff_async(|| async { Err("always fails") })
+            .await;
+
+        assert_eq!(result, Err("always fails"));
     }
 } 

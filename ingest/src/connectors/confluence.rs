@@ -106,47 +106,54 @@ impl ConfluenceConnector {
         let url = format!("{}/rest/api/content/search", self.config.base_url);
         let cql = self.build_cql_query();
 
-        let response = self.backoff
-            .execute_with_backoff(|| async {
-                let response = self.http_client
+        let batch_size = self.config.batch_size;
+        let http_client = &self.http_client;
+        let search_response: ConfluenceSearchResponse = self.backoff
+            .execute_with_backoff_async(|| async {
+                let response = http_client
                     .post(&url)
                     .header("Authorization", format!("Bearer {}", token.access_token))
                     .header("Accept", "application/json")
                     .header("Content-Type", "application/json")
                     .json(&serde_json::json!({
                         "cql": cql,
-                        "limit": self.config.batch_size,
+                        "limit": batch_size,
                         "expand": "body.storage,version,space,history.lastUpdated,history.createdBy,history.lastUpdatedBy"
                     }))
                     .send()
-                    .await?;
+                    .await
+                    .map_err(|e| format!("Confluence request failed: {}", e))?;
 
                 if !response.status().is_success() {
                     return Err(format!("Confluence API error: {}", response.status()));
                 }
 
-                let search_response: ConfluenceSearchResponse = response.json().await?;
-                Ok(search_response)
+                response
+                    .json::<ConfluenceSearchResponse>()
+                    .await
+                    .map_err(|e| format!("Failed to parse Confluence response: {}", e))
             })
             .await?;
 
-        let mut documents = Vec::new();
-        for page in response.results {
-            if let Some(document) = self.convert_page_to_document(page).await? {
-                documents.push(document);
-            }
-        }
+        let results = search_response.results;
+        let page_count = results.len();
 
-        // Update last sync timestamp
-        if let Some(last_page) = response.results.last() {
+        if let Some(last_page) = results.last() {
             if let Ok(timestamp) = self.parse_confluence_timestamp(&last_page.last_modified_date) {
                 self.last_sync_timestamp = Some(timestamp);
             }
         }
 
+        let mut documents = Vec::new();
+        for page in results {
+            if let Some(document) = self.convert_page_to_document(page).await? {
+                documents.push(document);
+            }
+        }
+
         tracing::info!(
             "Polled {} Confluence pages, converted {} to documents",
-            response.results.len(),
+            page_count,
             documents.len()
         );
 
@@ -183,16 +190,21 @@ impl ConfluenceConnector {
         let content = self.extract_content(&page)?;
         let content_sha256 = self.compute_content_hash(&content);
 
+        // Extract metadata (which borrows `page`) before consuming its fields.
+        let extra_metadata = self.extract_metadata(&page);
+        let created_at = self.parse_timestamp(&page.created_date)?;
+        let modified_at = self.parse_timestamp(&page.last_modified_date)?;
+
         let metadata = DocumentMetadata {
             source_id: page.id,
             title: page.title,
             url: format!("{}{}", self.config.base_url, page._links.webui),
             author: page.created_by.display_name,
-            created_at: self.parse_timestamp(&page.created_date)?,
-            modified_at: self.parse_timestamp(&page.last_modified_date)?,
+            created_at,
+            modified_at,
             version: page.version.number,
             status: page.status,
-            metadata: self.extract_metadata(&page),
+            metadata: extra_metadata,
         };
 
         let mut document: SpecDocument = metadata.into();
@@ -348,9 +360,9 @@ mod tests {
 
         let connector = ConfluenceConnector::new(config);
         let timestamp = connector.parse_timestamp("2023-01-01T12:00:00.000Z").unwrap();
-        
-        assert!(timestamp.seconds > 0);
-        assert!(timestamp.nanos >= 0);
+
+        assert!(timestamp.timestamp() > 0);
+        assert_eq!(timestamp.date_naive().to_string(), "2023-01-01");
     }
 
     #[test]

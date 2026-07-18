@@ -1,7 +1,9 @@
 use aws_sdk_secretsmanager::Client as SecretsClient;
 use aws_sdk_kms::Client as KmsClient;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+
+/// AES-256-GCM nonce length in bytes (96 bits, the standard/recommended size).
+const GCM_NONCE_LEN: usize = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedSecret {
@@ -46,7 +48,7 @@ impl SecretsManager {
         let data_key_response = self.kms_client
             .generate_data_key()
             .key_id(&self.key_id)
-            .key_spec("AES_256")
+            .key_spec(aws_sdk_kms::types::DataKeySpec::Aes256)
             .send()
             .await?;
 
@@ -62,7 +64,7 @@ impl SecretsManager {
         // Create the encrypted secret structure
         let encrypted_secret = EncryptedSecret {
             encrypted_data,
-            encrypted_key: encrypted_key.to_vec(),
+            encrypted_key: encrypted_key.as_ref().to_vec(),
             key_id: self.key_id.clone(),
             algorithm: "AES256".to_string(),
             version: 1,
@@ -100,7 +102,9 @@ impl SecretsManager {
         let decrypted_key_response = self.kms_client
             .decrypt()
             .key_id(&encrypted_secret.key_id)
-            .ciphertext_blob(aws_sdk_kms::types::Blob::new(&encrypted_secret.encrypted_key))
+            .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(
+                encrypted_secret.encrypted_key.clone(),
+            ))
             .send()
             .await?;
 
@@ -116,31 +120,11 @@ impl SecretsManager {
     }
 
     fn encrypt_with_key(&self, data: &[u8], key: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        use aes_gcm::{Aes256Gcm, Key, Nonce};
-        use aes_gcm::aead::{Aead, NewAead};
-
-        let cipher = Aes256Gcm::new(Key::from_slice(key));
-        let nonce = Nonce::from_slice(b"unique nonce"); // In production, use random nonce
-
-        let ciphertext = cipher
-            .encrypt(nonce, data)
-            .map_err(|e| format!("Encryption failed: {}", e))?;
-
-        Ok(ciphertext)
+        encrypt_aes_256_gcm(data, key)
     }
 
     fn decrypt_with_key(&self, encrypted_data: &[u8], key: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        use aes_gcm::{Aes256Gcm, Key, Nonce};
-        use aes_gcm::aead::{Aead, NewAead};
-
-        let cipher = Aes256Gcm::new(Key::from_slice(key));
-        let nonce = Nonce::from_slice(b"unique nonce"); // In production, use stored nonce
-
-        let plaintext = cipher
-            .decrypt(nonce, encrypted_data)
-            .map_err(|e| format!("Decryption failed: {}", e))?;
-
-        Ok(plaintext)
+        decrypt_aes_256_gcm(encrypted_data, key)
     }
 
     pub async fn list_secrets(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -151,7 +135,6 @@ impl SecretsManager {
 
         let secret_names = response
             .secret_list()
-            .unwrap_or(&[])
             .iter()
             .map(|secret| secret.name().unwrap_or_default().to_string())
             .collect();
@@ -172,18 +155,70 @@ impl SecretsManager {
     }
 }
 
+/// Encrypt `data` under a 32-byte AES-256 key using AES-256-GCM.
+///
+/// A fresh random 96-bit nonce is generated for every call and prepended to
+/// the returned ciphertext (`nonce || ciphertext || tag`). Reusing a nonce
+/// with GCM is catastrophic, so a per-message random nonce is used rather than
+/// a hard-coded value.
+fn encrypt_aes_256_gcm(data: &[u8], key: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use rand::RngCore;
+
+    if key.len() != 32 {
+        return Err(format!("AES-256 key must be 32 bytes, got {}", key.len()).into());
+    }
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+
+    let mut nonce_bytes = [0u8; GCM_NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, data)
+        .map_err(|e| format!("Encryption failed: {}", e))?;
+
+    let mut out = Vec::with_capacity(GCM_NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Decrypt a payload produced by [`encrypt_aes_256_gcm`], i.e. a
+/// `nonce || ciphertext || tag` blob under a 32-byte AES-256 key.
+fn decrypt_aes_256_gcm(
+    encrypted: &[u8],
+    key: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+
+    if key.len() != 32 {
+        return Err(format!("AES-256 key must be 32 bytes, got {}", key.len()).into());
+    }
+    if encrypted.len() < GCM_NONCE_LEN {
+        return Err("ciphertext too short to contain a nonce".into());
+    }
+
+    let (nonce_bytes, ciphertext) = encrypted.split_at(GCM_NONCE_LEN);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| format!("Decryption failed: {}", e))?;
+
+    Ok(plaintext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_sdk_secretsmanager::config::Config as SecretsConfig;
-    use aws_sdk_kms::config::Config as KmsConfig;
-    use aws_config::BehaviorVersion;
 
-    #[tokio::test]
-    async fn test_oauth2_credentials_encryption() {
-        // This test would require AWS credentials and proper setup
-        // For now, we'll test the encryption/decryption functions directly
-        
+    #[test]
+    fn test_encrypt_decrypt_round_trip() {
         let credentials = OAuth2Credentials {
             client_id: "test_client_id".to_string(),
             client_secret: "test_client_secret".to_string(),
@@ -193,13 +228,43 @@ mod tests {
             auth_endpoint: "https://example.com/auth".to_string(),
         };
 
-        let credentials_json = serde_json::to_vec(&credentials).unwrap();
-        
-        // Test with a dummy key (in production, this would be from KMS)
-        let dummy_key = vec![1u8; 32];
-        
-        // This test is incomplete without proper AWS setup
-        // In a real environment, you'd mock the AWS clients
-        assert_eq!(credentials_json.len(), 0); // Placeholder assertion
+        let plaintext = serde_json::to_vec(&credentials).unwrap();
+        let key = [7u8; 32];
+
+        let ciphertext = encrypt_aes_256_gcm(&plaintext, &key).unwrap();
+        // Ciphertext must differ from plaintext and carry the nonce + GCM tag.
+        assert_ne!(ciphertext, plaintext);
+        assert!(ciphertext.len() > plaintext.len() + GCM_NONCE_LEN);
+
+        let recovered = decrypt_aes_256_gcm(&ciphertext, &key).unwrap();
+        assert_eq!(recovered, plaintext);
+
+        let round_tripped: OAuth2Credentials = serde_json::from_slice(&recovered).unwrap();
+        assert_eq!(round_tripped.client_id, credentials.client_id);
+        assert_eq!(round_tripped.client_secret, credentials.client_secret);
+    }
+
+    #[test]
+    fn test_encrypt_uses_random_nonce() {
+        let key = [3u8; 32];
+        let data = b"same plaintext";
+        let a = encrypt_aes_256_gcm(data, &key).unwrap();
+        let b = encrypt_aes_256_gcm(data, &key).unwrap();
+        // Distinct random nonces mean identical plaintext encrypts differently.
+        assert_ne!(a, b);
+        assert_eq!(decrypt_aes_256_gcm(&a, &key).unwrap(), data);
+        assert_eq!(decrypt_aes_256_gcm(&b, &key).unwrap(), data);
+    }
+
+    #[test]
+    fn test_decrypt_rejects_wrong_key() {
+        let data = b"secret";
+        let ciphertext = encrypt_aes_256_gcm(data, &[1u8; 32]).unwrap();
+        assert!(decrypt_aes_256_gcm(&ciphertext, &[2u8; 32]).is_err());
+    }
+
+    #[test]
+    fn test_encrypt_rejects_bad_key_length() {
+        assert!(encrypt_aes_256_gcm(b"x", &[0u8; 16]).is_err());
     }
 } 

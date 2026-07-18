@@ -1,13 +1,15 @@
+use std::sync::Arc;
+
 use ingest::{
     ConnectorConfig, IngestionConnector, OAuth2Token,
     connectors::JiraConnector,
+    publisher::DocumentPublisher,
     secrets::SecretsManager,
 };
 use aws_sdk_secretsmanager::Client as SecretsClient;
 use aws_sdk_kms::Client as KmsClient;
-use nats::jetstream::Context as JetStreamContext;
 use tokio::signal;
-use tracing::{info, error, warn};
+use tracing::{info, error};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,19 +35,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("KMS_KEY_ID").unwrap_or_else(|_| "alias/spec-to-proof".to_string()),
     );
 
-    // Initialize NATS JetStream
-    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-    let nc = nats::connect(&nats_url)?;
-    let jetstream = nats::jetstream::new(nc);
+    // Initialize the document publisher. With the `nats-jetstream` feature the
+    // connector publishes to a real NATS JetStream cluster; without it we fall
+    // back to an in-memory publisher so the binary still runs (documents are
+    // not delivered anywhere durable, which is logged prominently).
+    let publisher = build_publisher().await?;
 
     // Initialize Jira connector
     let mut jira_connector = JiraConnector::new(config.clone());
 
     // Initialize ingestion connector
     let ingestion_connector = IngestionConnector::new(
-        config,
+        config.clone(),
         secrets_client,
-        jetstream,
+        publisher,
     ).await?;
 
     info!("Jira connector initialized successfully");
@@ -77,10 +80,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Build the document publisher based on the compiled feature set.
+async fn build_publisher() -> Result<Arc<dyn DocumentPublisher>, Box<dyn std::error::Error>> {
+    #[cfg(feature = "nats-jetstream")]
+    {
+        let nats_url =
+            std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+        info!("Connecting to NATS JetStream at {}", nats_url);
+        let publisher = ingest::publisher::NatsJetStreamPublisher::connect(&nats_url)
+            .await
+            .map_err(|e| format!("failed to connect to NATS JetStream at {}: {}", nats_url, e))?;
+        Ok(Arc::new(publisher))
+    }
+    #[cfg(not(feature = "nats-jetstream"))]
+    {
+        tracing::warn!(
+            "built without the `nats-jetstream` feature: using an in-memory publisher; \
+             ingested documents will NOT be delivered to NATS. Rebuild with \
+             `--features nats-jetstream` for production use."
+        );
+        Ok(Arc::new(ingest::publisher::InMemoryPublisher::new()))
+    }
+}
+
 fn load_config() -> Result<ConnectorConfig, Box<dyn std::error::Error>> {
     let source_system = std::env::var("SOURCE_SYSTEM").unwrap_or_else(|_| "jira".to_string());
     let base_url = std::env::var("JIRA_BASE_URL")
-        .ok_or("JIRA_BASE_URL environment variable is required")?;
+        .map_err(|_| "JIRA_BASE_URL environment variable is required")?;
     let rate_limit_per_minute = std::env::var("RATE_LIMIT_PER_MINUTE")
         .unwrap_or_else(|_| "100".to_string())
         .parse::<u32>()?;
@@ -91,7 +117,7 @@ fn load_config() -> Result<ConnectorConfig, Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "300".to_string())
         .parse::<u64>()?;
     let secrets_arn = std::env::var("SECRETS_ARN")
-        .ok_or("SECRETS_ARN environment variable is required")?;
+        .map_err(|_| "SECRETS_ARN environment variable is required")?;
 
     Ok(ConnectorConfig {
         source_system,
@@ -131,19 +157,21 @@ async fn poll_and_publish(
         return Ok(());
     }
 
-    // Publish documents to JetStream
+    // Publish documents to the configured transport.
+    let document_count = documents.len();
     for document in documents {
+        let document_id = document.id.clone();
         match ingestion_connector.publish_document(document).await {
             Ok(_) => {
-                info!("Published document {} to JetStream", document.id);
+                info!("Published document {}", document_id);
             }
             Err(e) => {
-                error!("Failed to publish document {}: {}", document.id, e);
+                error!("Failed to publish document {}: {}", document_id, e);
             }
         }
     }
 
-    info!("Successfully processed {} documents from Jira", documents.len());
+    info!("Successfully processed {} documents from Jira", document_count);
     Ok(())
 }
 

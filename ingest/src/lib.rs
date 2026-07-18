@@ -1,12 +1,13 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 use aws_sdk_secretsmanager::Client as SecretsClient;
-use nats::jetstream::Context as JetStreamContext;
 use chrono::{DateTime, Utc};
 use prost::Message;
 use crate::proto::spec_to_proof::v1::SpecDocument;
+use crate::publisher::DocumentPublisher;
 use prost_types::Timestamp;
 
 pub mod proto;
@@ -14,6 +15,7 @@ pub mod connectors;
 pub mod secrets;
 pub mod rate_limiter;
 pub mod backoff;
+pub mod publisher;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorConfig {
@@ -34,11 +36,10 @@ pub struct OAuth2Token {
     pub token_type: String,
 }
 
-#[derive(Debug)]
 pub struct IngestionConnector {
     config: ConnectorConfig,
     secrets_client: SecretsClient,
-    jetstream: JetStreamContext,
+    publisher: Arc<dyn DocumentPublisher>,
     token_cache: RwLock<HashMap<String, OAuth2Token>>,
     rate_limiter: rate_limiter::RateLimiter,
 }
@@ -47,7 +48,7 @@ impl IngestionConnector {
     pub async fn new(
         config: ConnectorConfig,
         secrets_client: SecretsClient,
-        jetstream: JetStreamContext,
+        publisher: Arc<dyn DocumentPublisher>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let rate_limiter = rate_limiter::RateLimiter::new(
             config.rate_limit_per_minute,
@@ -57,7 +58,7 @@ impl IngestionConnector {
         Ok(Self {
             config,
             secrets_client,
-            jetstream,
+            publisher,
             token_cache: RwLock::new(HashMap::new()),
             rate_limiter,
         })
@@ -86,27 +87,41 @@ impl IngestionConnector {
     }
 
     async fn poll_documents(&self) -> Result<Vec<SpecDocument>, Box<dyn std::error::Error>> {
-        // This will be implemented by specific connectors
-        todo!("Implement in specific connector")
+        // The generic service does not poll any source directly; a
+        // source-specific connector (Jira/Confluence/Google Docs) supplies the
+        // polling implementation. Return a clear error instead of `todo!()` so
+        // that a misconfigured deployment fails cleanly rather than panicking
+        // inside the `start_polling` loop.
+        Err(format!(
+            "poll_documents is not implemented for the generic ingest service (source_system='{}'); use a source-specific connector",
+            self.config.source_system
+        )
+        .into())
     }
 
-    async fn publish_document(&self, document: SpecDocument) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn publish_document(&self, document: SpecDocument) -> Result<(), Box<dyn std::error::Error>> {
         let subject = format!("spec-documents.{}", self.config.source_system);
-        
+
         let payload = document.encode_to_vec();
-        
-        self.jetstream
+
+        self.publisher
             .publish(&subject, &payload)
             .await
-            .map_err(|e| format!("Failed to publish to JetStream: {}", e))?;
+            .map_err(|e| format!("Failed to publish document: {}", e))?;
 
         tracing::info!(
-            "Published document {} to JetStream subject {}",
+            "Published document {} to subject {}",
             document.id,
             subject
         );
 
         Ok(())
+    }
+
+    /// Access the rate limiter (used by the connector's polling logic and by
+    /// tests that assert on rate-limit accounting).
+    pub fn rate_limiter(&self) -> &rate_limiter::RateLimiter {
+        &self.rate_limiter
     }
 
     pub async fn refresh_token(&self, token_key: &str) -> Result<OAuth2Token, Box<dyn std::error::Error>> {

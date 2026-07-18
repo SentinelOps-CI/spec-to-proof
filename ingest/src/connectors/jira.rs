@@ -1,5 +1,5 @@
 use crate::{
-    ConnectorConfig, IngestionConnector, OAuth2Token, DocumentMetadata,
+    ConnectorConfig, OAuth2Token, DocumentMetadata,
     rate_limiter::RateLimiter, backoff::ExponentialBackoff,
 };
 use crate::proto::spec_to_proof::v1::SpecDocument;
@@ -7,7 +7,6 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JiraIssue {
@@ -34,9 +33,10 @@ pub struct JiraFields {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JiraStatus {
     pub name: String,
-    pub statusCategory: JiraStatusCategory,
+    pub status_category: JiraStatusCategory,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,9 +45,10 @@ pub struct JiraStatusCategory {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JiraUser {
-    pub displayName: String,
-    pub emailAddress: Option<String>,
+    pub display_name: String,
+    pub email_address: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,19 +85,21 @@ pub struct JiraHistory {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JiraChangeItem {
     pub field: String,
     pub fieldtype: String,
-    pub fromString: Option<String>,
-    pub toString: Option<String>,
+    pub from_string: Option<String>,
+    pub to_string: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JiraSearchResponse {
     pub issues: Vec<JiraIssue>,
     pub total: i32,
-    pub maxResults: i32,
-    pub startAt: i32,
+    pub max_results: i32,
+    pub start_at: i32,
 }
 
 pub struct JiraConnector {
@@ -128,53 +131,68 @@ impl JiraConnector {
         }
     }
 
+    /// Access the connector's rate limiter (used for observability and tests).
+    pub fn rate_limiter(&self) -> &RateLimiter {
+        &self.rate_limiter
+    }
+
     pub async fn poll_documents(&mut self, token: &OAuth2Token) -> Result<Vec<SpecDocument>, Box<dyn std::error::Error>> {
         self.rate_limiter.acquire().await?;
 
         let jql = self.build_jql_query();
         let url = format!("{}/rest/api/3/search", self.config.base_url);
 
-        let response = self.backoff
-            .execute_with_backoff(|| async {
-                let response = self.http_client
+        let batch_size = self.config.batch_size.to_string();
+        let fields = "summary,description,status,assignee,reporter,created,updated,project,issuetype,priority,labels,components";
+        let http_client = &self.http_client;
+        let search_response: JiraSearchResponse = self.backoff
+            .execute_with_backoff_async(|| async {
+                let response = http_client
                     .get(&url)
                     .header("Authorization", format!("Bearer {}", token.access_token))
                     .header("Accept", "application/json")
                     .query(&[
-                        ("jql", &jql),
-                        ("maxResults", &self.config.batch_size.to_string()),
-                        ("fields", &"summary,description,status,assignee,reporter,created,updated,project,issuetype,priority,labels,components".to_string()),
-                        ("expand", &"changelog".to_string()),
+                        ("jql", jql.as_str()),
+                        ("maxResults", batch_size.as_str()),
+                        ("fields", fields),
+                        ("expand", "changelog"),
                     ])
                     .send()
-                    .await?;
+                    .await
+                    .map_err(|e| format!("Jira request failed: {}", e))?;
 
                 if !response.status().is_success() {
                     return Err(format!("Jira API error: {}", response.status()));
                 }
 
-                let search_response: JiraSearchResponse = response.json().await?;
-                Ok(search_response)
+                response
+                    .json::<JiraSearchResponse>()
+                    .await
+                    .map_err(|e| format!("Failed to parse Jira response: {}", e))
             })
             .await?;
 
-        let mut documents = Vec::new();
-        for issue in response.issues {
-            if let Some(document) = self.convert_issue_to_document(issue).await? {
-                documents.push(document);
-            }
-        }
+        let issues = search_response.issues;
+        let issue_count = issues.len();
 
-        // Update last sync timestamp
-        if let Some(last_issue) = response.issues.last() {
+        // Advance the sync cursor using the most recently updated issue before
+        // the issues are consumed by the conversion loop below.
+        if let Some(last_issue) = issues.last() {
             if let Ok(timestamp) = self.parse_jira_timestamp(&last_issue.fields.updated) {
                 self.last_sync_timestamp = Some(timestamp);
             }
         }
 
+        let mut documents = Vec::new();
+        for issue in issues {
+            if let Some(document) = self.convert_issue_to_document(issue).await? {
+                documents.push(document);
+            }
+        }
+
         tracing::info!(
             "Polled {} Jira issues, converted {} to documents",
-            response.issues.len(),
+            issue_count,
             documents.len()
         );
 
@@ -208,18 +226,24 @@ impl JiraConnector {
         let content = self.extract_content(&issue)?;
         let content_sha256 = self.compute_content_hash(&content);
 
+        // Extract metadata (which borrows `issue`) before consuming any of the
+        // issue's fields below.
+        let extra_metadata = self.extract_metadata(&issue);
+        let created_at = self.parse_timestamp(&issue.fields.created)?;
+        let modified_at = self.parse_timestamp(&issue.fields.updated)?;
+
         let metadata = DocumentMetadata {
-            source_id: issue.key,
+            source_id: issue.key.clone(),
             title: issue.fields.summary,
             url: format!("{}/browse/{}", self.config.base_url, issue.key),
             author: issue.fields.reporter
-                .map(|r| r.displayName)
+                .map(|r| r.display_name)
                 .unwrap_or_else(|| "Unknown".to_string()),
-            created_at: self.parse_timestamp(&issue.fields.created)?,
-            modified_at: self.parse_timestamp(&issue.fields.updated)?,
+            created_at,
+            modified_at,
             version: 1, // Jira doesn't have explicit versions
             status: issue.fields.status.name,
-            metadata: self.extract_metadata(&issue),
+            metadata: extra_metadata,
         };
 
         let mut document: SpecDocument = metadata.into();
@@ -273,7 +297,7 @@ impl JiraConnector {
         
         for history in &changelog.histories {
             for item in &history.items {
-                if let (Some(from), Some(to)) = (&item.fromString, &item.toString) {
+                if let (Some(from), Some(to)) = (&item.from_string, &item.to_string) {
                     changes.push(format!("- {}: {} → {}", item.field, from, to));
                 }
             }
@@ -294,8 +318,8 @@ impl JiraConnector {
         }
         
         if let Some(assignee) = &issue.fields.assignee {
-            metadata.insert("assignee".to_string(), assignee.displayName.clone());
-            if let Some(email) = &assignee.emailAddress {
+            metadata.insert("assignee".to_string(), assignee.display_name.clone());
+            if let Some(email) = &assignee.email_address {
                 metadata.insert("assignee_email".to_string(), email.clone());
             }
         }
@@ -331,7 +355,6 @@ impl JiraConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost_types::Timestamp;
 
     #[test]
     fn test_build_jql_query() {
@@ -383,8 +406,8 @@ mod tests {
 
         let connector = JiraConnector::new(config);
         let timestamp = connector.parse_timestamp("2023-01-01T12:00:00.000+0000").unwrap();
-        
-        assert!(timestamp.seconds > 0);
-        assert!(timestamp.nanos >= 0);
+
+        assert!(timestamp.timestamp() > 0);
+        assert_eq!(timestamp.date_naive().to_string(), "2023-01-01");
     }
 } 
