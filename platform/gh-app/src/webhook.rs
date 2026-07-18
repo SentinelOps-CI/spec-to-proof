@@ -1,21 +1,19 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use hmac::{Hmac, Mac};
-use sha2::{Sha256, Digest};
-use hex;
+use sha2::Sha256;
 use anyhow::{Result, Context};
-use tracing::{info, warn, error};
-use chrono::{DateTime, Utc};
+use tracing::{info, warn};
 
 use crate::config::GitHubAppConfig;
 use crate::proto::gh_app::v1::*;
 
-#[derive(Debug, Clone)]
 pub struct WebhookProcessor {
     config: GitHubAppConfig,
     event_handlers: HashMap<String, Box<dyn EventHandler + Send + Sync>>,
+    #[allow(dead_code)]
     signature_cache: HashMap<String, Instant>,
 }
 
@@ -320,7 +318,7 @@ impl EventHandler for PullRequestHandler {
         let mut badge_updates = Vec::new();
         let mut processed_events = Vec::new();
         
-        if let Some(pr) = &payload.pull_request {
+        if payload.pull_request.is_some() {
             if let Some(action) = &payload.action {
                 match action.as_str() {
                     "opened" | "synchronize" | "reopened" => {
@@ -328,19 +326,8 @@ impl EventHandler for PullRequestHandler {
                         let spec_documents = self.extract_spec_documents(payload).await?;
                         
                         if !spec_documents.is_empty() {
-                            // Create badge status request
-                            let badge_request = BadgeStatusRequest {
-                                repository_id: pr.base.repo.id.to_string(),
-                                pull_request_id: pr.id.to_string(),
-                                commit_sha: pr.head.sha.clone(),
-                                spec_document_ids: spec_documents,
-                                installation_id: payload.installation.as_ref()
-                                    .map(|i| i.id.to_string())
-                                    .unwrap_or_default(),
-                                app_id: self.config.app_id.clone(),
-                            };
-                            
-                            // Create badge response
+                            // Create the pending badge response that the caller
+                            // (server/lib layer) persists via the BadgeManager.
                             let badge_response = BadgeStatusResponse {
                                 status: BadgeStatus::BadgeStatusPending,
                                 message: "Verifying spec documents...".to_string(),
@@ -349,8 +336,8 @@ impl EventHandler for PullRequestHandler {
                                 context: self.config.badge_context.clone(),
                                 proof_artifacts: Vec::new(),
                                 sigstore_entries: Vec::new(),
-                                created_at: Some(chrono::Utc::now().into()),
-                                updated_at: Some(chrono::Utc::now().into()),
+                                created_at: Some(chrono::Utc::now()),
+                                updated_at: Some(chrono::Utc::now()),
                             };
                             
                             badge_updates.push(badge_response);
@@ -404,20 +391,8 @@ impl EventHandler for PushHandler {
         if !spec_documents.is_empty() {
             // Create badge status request for the head commit
             if let Some(head_commit) = &payload.head_commit {
-                let badge_request = BadgeStatusRequest {
-                    repository_id: payload.repository.as_ref()
-                        .map(|r| r.id.to_string())
-                        .unwrap_or_default(),
-                    pull_request_id: "".to_string(), // No PR for push events
-                    commit_sha: head_commit.id.clone(),
-                    spec_document_ids: spec_documents,
-                    installation_id: payload.installation.as_ref()
-                        .map(|i| i.id.to_string())
-                        .unwrap_or_default(),
-                    app_id: self.config.app_id.clone(),
-                };
-                
-                // Create badge response
+                let _ = &head_commit.id;
+                // Create the pending badge response for the head commit.
                 let badge_response = BadgeStatusResponse {
                     status: BadgeStatus::BadgeStatusPending,
                     message: "Verifying spec documents...".to_string(),
@@ -426,8 +401,8 @@ impl EventHandler for PushHandler {
                     context: self.config.badge_context.clone(),
                     proof_artifacts: Vec::new(),
                     sigstore_entries: Vec::new(),
-                    created_at: Some(chrono::Utc::now().into()),
-                    updated_at: Some(chrono::Utc::now().into()),
+                    created_at: Some(chrono::Utc::now()),
+                    updated_at: Some(chrono::Utc::now()),
                 };
                 
                 badge_updates.push(badge_response);
@@ -447,6 +422,7 @@ impl EventHandler for PushHandler {
 
 // Status Event Handler
 pub struct StatusHandler {
+    #[allow(dead_code)]
     config: GitHubAppConfig,
 }
 
@@ -460,12 +436,11 @@ impl StatusHandler {
 
 #[async_trait::async_trait]
 impl EventHandler for StatusHandler {
-    async fn handle(&self, payload: &WebhookPayload) -> Result<ProcessWebhookResponse> {
+    async fn handle(&self, _payload: &WebhookPayload) -> Result<ProcessWebhookResponse> {
         info!("Handling status event");
         
-        let mut processed_events = Vec::new();
-        processed_events.push("status".to_string());
-        
+        let processed_events = vec!["status".to_string()];
+
         Ok(ProcessWebhookResponse {
             success: true,
             message: "Status event processed successfully".to_string(),
@@ -481,6 +456,7 @@ trait SpecDocumentExtractor {
     async fn extract_spec_documents(&self, payload: &WebhookPayload) -> Result<Vec<String>>;
 }
 
+#[async_trait::async_trait]
 impl SpecDocumentExtractor for PullRequestHandler {
     async fn extract_spec_documents(&self, payload: &WebhookPayload) -> Result<Vec<String>> {
         let mut spec_documents = Vec::new();
@@ -496,6 +472,7 @@ impl SpecDocumentExtractor for PullRequestHandler {
     }
 }
 
+#[async_trait::async_trait]
 impl SpecDocumentExtractor for PushHandler {
     async fn extract_spec_documents(&self, payload: &WebhookPayload) -> Result<Vec<String>> {
         let mut spec_documents = Vec::new();
@@ -516,6 +493,7 @@ impl SpecDocumentExtractor for PushHandler {
     }
 }
 
+#[async_trait::async_trait]
 impl SpecDocumentExtractor for StatusHandler {
     async fn extract_spec_documents(&self, _payload: &WebhookPayload) -> Result<Vec<String>> {
         Ok(Vec::new()) // Status events don't contain spec documents
