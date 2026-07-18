@@ -3,19 +3,23 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { InvariantCard } from '../InvariantCard';
 import { Invariant, InvariantStatus, Priority } from '@/types/spec-to-proof';
 
-// Mock tRPC
-jest.mock('@/lib/trpc', () => ({
-  trpc: {
-    invariant: {
-      update: {
-        useMutation: () => ({
-          mutate: jest.fn(),
-          isLoading: false,
-        }),
+// Mock tRPC. The card renders the split/rename modals (which register their own
+// mutations at render time), so every mutation used by the component subtree
+// must be stubbed, not just `update`.
+jest.mock('@/lib/trpc', () => {
+  const mutationStub = () => ({ mutate: jest.fn(), isLoading: false });
+  return {
+    trpc: {
+      invariant: {
+        update: { useMutation: mutationStub },
+        split: { useMutation: mutationStub },
+        rename: { useMutation: mutationStub },
+        confirm: { useMutation: mutationStub },
+        reject: { useMutation: mutationStub },
       },
     },
-  },
-}));
+  };
+});
 
 // Mock toast
 jest.mock('@/components/ui/Toast', () => ({
@@ -43,7 +47,9 @@ const mockInvariant: Invariant = {
   units: {},
   confidenceScore: 0.95,
   sourceDocumentId: 'doc-123',
-  extractedAt: new Date('2024-01-01'),
+  // Local-time construction keeps `toLocaleDateString()` deterministic across
+  // timezones (a UTC-midnight date would render as the previous day west of UTC).
+  extractedAt: new Date(2024, 0, 1),
   status: InvariantStatus.EXTRACTED,
   tags: ['mathematics', 'algebra'],
   priority: Priority.HIGH,

@@ -162,28 +162,4 @@ export function handleTRPCError(error: any): TRPCError {
     500,
     error
   );
-<<<<<<< Current (Your changes)
-} 
-=======
 }
-
-// Server-side tRPC exports for testing and server implementations
-export const createTRPCRouter = (routes: any) => routes;
-export const publicProcedure = {
-  input: (schema: any) => ({
-    output: (schema: any) => ({
-      query: (fn: any) => fn,
-      mutation: (fn: any) => fn,
-    }),
-    query: (fn: any) => fn,
-    mutation: (fn: any) => fn,
-  }),
-  output: (schema: any) => ({
-    query: (fn: any) => fn,
-    mutation: (fn: any) => fn,
-  }),
-  query: (fn: any) => fn,
-  mutation: (fn: any) => fn,
-};
-export const protectedProcedure = publicProcedure; 
->>>>>>> Incoming (Background Agent changes)

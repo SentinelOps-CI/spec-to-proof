@@ -1,5 +1,12 @@
-import { describe, it, expect, beforeEach } from '@jest/globals';
-import { CoverageCalculator, CoverageMetrics } from '../coverage';
+import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import {
+  CoverageCalculator,
+  CoverageMetrics,
+  InMemoryCoverageDataSource,
+  HttpCoverageDataSource,
+  resolveCoverageDataSource,
+  setCoverageDataSource,
+} from '../coverage';
 
 // Mock data for testing
 const mockCoverageData = {
@@ -376,5 +383,104 @@ describe('Coverage API Error Handling', () => {
   it('should handle empty trends data', () => {
     const result = CoverageCalculator.calculateTrends([]);
     expect(result).toEqual([]);
+  });
+});
+
+describe('InMemoryCoverageDataSource', () => {
+  const ds = new InMemoryCoverageDataSource();
+
+  it('derives overall stats from the seeded user stories', async () => {
+    const stats = await ds.getOverallStats({ repository: 'my-repo', timeRange: '30d' });
+    expect(stats.repository).toBe('my-repo');
+    expect(stats.totalSpecs).toBeGreaterThan(0);
+    expect(stats.provenSpecs).toBeLessThanOrEqual(stats.totalSpecs);
+    expect(stats.coveragePercentage).toBeGreaterThanOrEqual(0);
+    expect(stats.lastUpdated).toBeInstanceOf(Date);
+  });
+
+  it('returns user stories and looks them up by id', async () => {
+    const stories = await ds.getUserStories({});
+    expect(stories.length).toBeGreaterThan(0);
+    const found = await ds.getUserStory(stories[0].id);
+    expect(found?.id).toBe(stories[0].id);
+    expect(await ds.getUserStory('does-not-exist')).toBeNull();
+  });
+
+  it('limits top performers', async () => {
+    const performers = await ds.getTopPerformers({ limit: 2 });
+    expect(performers).toHaveLength(2);
+  });
+});
+
+describe('resolveCoverageDataSource', () => {
+  const originalApiUrl = process.env.COVERAGE_API_URL;
+  const originalDemo = process.env.COVERAGE_ALLOW_DEMO_DATA;
+
+  afterEach(() => {
+    setCoverageDataSource(null);
+    if (originalApiUrl === undefined) delete process.env.COVERAGE_API_URL;
+    else process.env.COVERAGE_API_URL = originalApiUrl;
+    if (originalDemo === undefined) delete process.env.COVERAGE_ALLOW_DEMO_DATA;
+    else process.env.COVERAGE_ALLOW_DEMO_DATA = originalDemo;
+  });
+
+  it('throws NOT_IMPLEMENTED when nothing is configured', () => {
+    delete process.env.COVERAGE_API_URL;
+    delete process.env.COVERAGE_ALLOW_DEMO_DATA;
+    expect(() => resolveCoverageDataSource()).toThrow(/not configured/i);
+  });
+
+  it('uses the in-memory source when demo data is explicitly allowed', () => {
+    delete process.env.COVERAGE_API_URL;
+    process.env.COVERAGE_ALLOW_DEMO_DATA = 'true';
+    expect(resolveCoverageDataSource()).toBeInstanceOf(InMemoryCoverageDataSource);
+  });
+
+  it('prefers the HTTP backend when COVERAGE_API_URL is set', () => {
+    process.env.COVERAGE_API_URL = 'https://api.example.com';
+    expect(resolveCoverageDataSource()).toBeInstanceOf(HttpCoverageDataSource);
+  });
+
+  it('honours an explicit override', () => {
+    const override = new InMemoryCoverageDataSource();
+    setCoverageDataSource(override);
+    expect(resolveCoverageDataSource()).toBe(override);
+  });
+});
+
+describe('HttpCoverageDataSource', () => {
+  beforeEach(() => CoverageMetrics.resetMetrics());
+
+  it('parses and validates a well-formed trends payload', async () => {
+    const payload = [
+      { date: '2024-01-01', coveragePercentage: 80, newSpecs: 10, provenSpecs: 8 },
+    ];
+    const fetchImpl = jest.fn(async () =>
+      new Response(JSON.stringify(payload), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    ) as unknown as typeof fetch;
+
+    const ds = new HttpCoverageDataSource('https://api.example.com', { fetchImpl });
+    const trends = await ds.getTrends({ timeRange: '30d' });
+
+    expect(trends).toEqual(payload);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(CoverageMetrics.getMetrics().apiCalls).toBe(1);
+    expect(CoverageMetrics.getMetrics().errors).toBe(0);
+  });
+
+  it('fails loudly on a malformed payload', async () => {
+    const fetchImpl = jest.fn(async () =>
+      new Response(JSON.stringify([{ date: 123 }]), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    ) as unknown as typeof fetch;
+
+    const ds = new HttpCoverageDataSource('https://api.example.com', { fetchImpl });
+    await expect(ds.getTrends({ timeRange: '30d' })).rejects.toThrow(/malformed/i);
+    expect(CoverageMetrics.getMetrics().errors).toBe(1);
+  });
+
+  it('surfaces non-2xx responses as errors', async () => {
+    const fetchImpl = jest.fn(async () => new Response('nope', { status: 500 })) as unknown as typeof fetch;
+    const ds = new HttpCoverageDataSource('https://api.example.com', { fetchImpl });
+    await expect(ds.getOverallStats({ timeRange: '30d' })).rejects.toThrow(/status 500/i);
   });
 }); 

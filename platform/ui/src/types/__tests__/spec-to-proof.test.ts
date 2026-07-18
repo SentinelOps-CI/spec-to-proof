@@ -295,7 +295,19 @@ describe('Spec-to-Proof Domain Models', () => {
     it('should generate SHA256 hash', () => {
       const content = 'test content';
       const hash = calculateSha256(content);
-      expect(hash).toBe('placeholder-sha256-hash');
+      // Real SHA-256 digest, matching the server-side Rust `sha2::Sha256`
+      // hashing of the same UTF-8 bytes.
+      expect(hash).toBe('6ae8a75555209fd6c44157c0aed8016e763ff435a19cf186f76863140143ff72');
+    });
+
+    it('should match known SHA256 test vectors', () => {
+      // FIPS 180-4 / NIST published vectors.
+      expect(calculateSha256('')).toBe(
+        'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+      );
+      expect(calculateSha256('abc')).toBe(
+        'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+      );
     });
 
     it('should generate UUID', () => {
