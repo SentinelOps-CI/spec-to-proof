@@ -75,8 +75,28 @@ Object.defineProperty(global, 'crypto', {
   },
 });
 
-// Mock tRPC client
+// Mock tRPC client.
+//
+// Both the React `trpc` client and the server-side helpers (`createTRPCRouter`,
+// `publicProcedure`, `protectedProcedure`) are stubbed here so that modules
+// which construct routers at import time (e.g. `lib/coverage.ts`) can be
+// evaluated in the test environment without a live tRPC runtime. This stub is
+// test-only; production code uses the real `initTRPC` implementation.
+const makeProcedureStub = () => {
+  const builder = {
+    input: () => builder,
+    output: () => builder,
+    use: () => builder,
+    query: (fn) => fn,
+    mutation: (fn) => fn,
+  };
+  return builder;
+};
+
 jest.mock('@/lib/trpc', () => ({
+  createTRPCRouter: (routes) => routes,
+  publicProcedure: makeProcedureStub(),
+  protectedProcedure: makeProcedureStub(),
   trpc: {
     invariant: {
       list: {
